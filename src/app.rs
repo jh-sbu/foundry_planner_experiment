@@ -7,7 +7,10 @@ use eframe::egui::{
 
 use crate::{
     data::{GameData, Recipe, TEMPLATE_ROOT_ENV, resolve_template_root},
-    model::{NodeId, Plan, PortRef, PortSide},
+    model::{
+        ConnectionState, NodeId, Plan, PlanEvaluation, PortRef, PortSide,
+        primary_rate_for_machine_count,
+    },
 };
 
 const SIDEBAR_WIDTH: f32 = 292.0;
@@ -48,6 +51,8 @@ pub struct PlannerApp {
     zoom: f32,
     dragged_port: Option<PortRef>,
     chooser: Option<RecipeChooser>,
+    count_edits: HashMap<NodeId, String>,
+    output_edits: HashMap<NodeId, String>,
     next_spawn: usize,
     fit_requested: bool,
 }
@@ -88,6 +93,8 @@ impl PlannerApp {
             zoom: 1.0,
             dragged_port: None,
             chooser: None,
+            count_edits: HashMap::new(),
+            output_edits: HashMap::new(),
             next_spawn: 0,
             fit_requested: false,
         }
@@ -154,6 +161,8 @@ impl PlannerApp {
                         if ui.button("Clear").clicked() {
                             self.plan = Plan::default();
                             self.selected_node = None;
+                            self.count_edits.clear();
+                            self.output_edits.clear();
                             self.next_spawn = 0;
                         }
                         let data_root_hover = self
@@ -269,8 +278,8 @@ impl PlannerApp {
         }
     }
 
-    fn summary_panel(&mut self, ctx: &egui::Context) {
-        let totals = self.plan.totals(&self.data);
+    fn summary_panel(&mut self, ctx: &egui::Context, evaluation: &PlanEvaluation) {
+        let totals = &evaluation.totals;
         egui::SidePanel::right("summary")
             .exact_width(SUMMARY_WIDTH)
             .resizable(false)
@@ -288,15 +297,62 @@ impl PlannerApp {
                     .inner_margin(Margin::same(12))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            metric(ui, "POWER", &format_power(totals.power_kw), ORANGE);
+                            let power = if totals.has_values {
+                                format_power(totals.power_kw)
+                            } else {
+                                "—".into()
+                            };
+                            let machines = if totals.has_values {
+                                format_number(totals.machine_count)
+                            } else {
+                                "—".into()
+                            };
+                            metric(ui, "POWER", &power, ORANGE);
                             ui.separator();
-                            metric(ui, "MACHINES", &format_number(totals.machine_count), CYAN);
+                            metric(ui, "MACHINES", &machines, CYAN);
                         });
                     });
+                if !totals.has_values && !self.plan.nodes.is_empty() {
+                    ui.label(
+                        RichText::new("Enter a count or output rate to anchor the plan.")
+                            .small()
+                            .color(MUTED),
+                    );
+                } else if evaluation.unresolved_nodes > 0 {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} unresolved node{} excluded from totals.",
+                            evaluation.unresolved_nodes,
+                            if evaluation.unresolved_nodes == 1 {
+                                ""
+                            } else {
+                                "s"
+                            }
+                        ))
+                        .small()
+                        .color(MUTED),
+                    );
+                }
                 ui.add_space(15.0);
-                flow_section(ui, "EXTERNAL INPUTS", &totals.inputs, RED, &self.data);
+                flow_section(
+                    ui,
+                    "EXTERNAL INPUTS",
+                    &totals.inputs,
+                    RED,
+                    &self.data,
+                    totals.has_values,
+                    evaluation.unresolved_nodes > 0,
+                );
                 ui.add_space(14.0);
-                flow_section(ui, "UNUSED OUTPUTS", &totals.outputs, GREEN, &self.data);
+                flow_section(
+                    ui,
+                    "UNUSED OUTPUTS",
+                    &totals.outputs,
+                    GREEN,
+                    &self.data,
+                    totals.has_values,
+                    evaluation.unresolved_nodes > 0,
+                );
 
                 ui.add_space(18.0);
                 ui.separator();
@@ -321,7 +377,18 @@ impl PlannerApp {
                 let Some(recipe) = self.data.recipe(&recipe_id) else {
                     return;
                 };
-                ui.label(RichText::new(&recipe.name).strong().color(TEXT));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&recipe.name).strong().color(TEXT));
+                    let pinned = self.plan.nodes[index].pinned_primary_rate.is_some();
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(if pinned { "PINNED" } else { "AUTO" })
+                                .small()
+                                .strong()
+                                .color(if pinned { ORANGE } else { CYAN }),
+                        );
+                    });
+                });
                 let options = self.data.machine_options(recipe);
                 if options.is_empty() {
                     ui.label(RichText::new("Manual / special crafting").color(MUTED));
@@ -347,13 +414,6 @@ impl PlannerApp {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label("Count");
-                    ui.add(
-                        egui::DragValue::new(&mut self.plan.nodes[index].machines)
-                            .range(0.1..=999.0)
-                            .speed(0.1)
-                            .fixed_decimals(1),
-                    );
                     ui.label("Clock");
                     ui.add(
                         egui::DragValue::new(&mut self.plan.nodes[index].clock_percent)
@@ -362,6 +422,57 @@ impl PlannerApp {
                             .speed(1.0),
                     );
                 });
+                let calculation = evaluation.node(selected).copied();
+                let count_value = calculation.map(|value| value.machines);
+                let output_value = calculation.map(|value| value.primary_rate);
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Count");
+                    let draft = self.count_edits.entry(selected).or_default();
+                    if let Some(count) = optional_number_edit(
+                        ui,
+                        Id::new(("count_edit", selected)),
+                        draft,
+                        count_value,
+                        78.0,
+                    ) && let Some(rate) = primary_rate_for_machine_count(
+                        &self.plan.nodes[index],
+                        recipe,
+                        count,
+                        &self.data,
+                    ) {
+                        self.plan.nodes[index].pinned_primary_rate = Some(rate);
+                    }
+                    ui.label("machines");
+                });
+                if let Some(primary) = recipe.outputs.first() {
+                    let output_name = self.data.item_name(&primary.item);
+                    ui.label(
+                        RichText::new(format!("Output — {output_name}"))
+                            .small()
+                            .color(MUTED),
+                    );
+                    ui.horizontal(|ui| {
+                        let draft = self.output_edits.entry(selected).or_default();
+                        if let Some(rate) = optional_number_edit(
+                            ui,
+                            Id::new(("output_edit", selected)),
+                            draft,
+                            output_value,
+                            96.0,
+                        ) {
+                            self.plan.nodes[index].pinned_primary_rate = Some(rate);
+                        }
+                        ui.label("/min");
+                        if self.plan.nodes[index].pinned_primary_rate.is_some()
+                            && ui.small_button("Unpin").clicked()
+                        {
+                            self.plan.nodes[index].pinned_primary_rate = None;
+                            self.count_edits.remove(&selected);
+                            self.output_edits.remove(&selected);
+                        }
+                    });
+                }
                 if let Some(machine) = self.plan.nodes[index]
                     .machine_id
                     .as_deref()
@@ -380,7 +491,7 @@ impl PlannerApp {
             });
     }
 
-    fn canvas(&mut self, ctx: &egui::Context) {
+    fn canvas(&mut self, ctx: &egui::Context, evaluation: &PlanEvaluation) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG))
             .show(ctx, |ui| {
@@ -418,7 +529,8 @@ impl PlannerApp {
                     let Some(to) = self.port_screen_position(&edge.to, canvas_rect) else {
                         continue;
                     };
-                    draw_connection(&painter, from, to, CYAN, 2.5);
+                    let color = connection_color(evaluation.connection_state(&edge.from));
+                    draw_connection(&painter, from, to, color, 2.5);
                 }
 
                 let pointer = ctx.pointer_hover_pos();
@@ -463,7 +575,8 @@ impl PlannerApp {
                     }
 
                     draw_node(
-                        &painter, rect, recipe, &node, &self.data, &self.plan, selected, self.zoom,
+                        &painter, rect, recipe, &node, &self.data, &self.plan, evaluation,
+                        selected, self.zoom,
                     );
 
                     let close_rect = Rect::from_center_size(
@@ -515,36 +628,38 @@ impl PlannerApp {
                     }
                 }
 
-                if let Some(id) = bring_to_front {
-                    if let Some(index) = self.plan.nodes.iter().position(|node| node.id == id) {
-                        let node = self.plan.nodes.remove(index);
-                        self.plan.nodes.push(node);
-                    }
+                if let Some(id) = bring_to_front
+                    && let Some(index) = self.plan.nodes.iter().position(|node| node.id == id)
+                {
+                    let node = self.plan.nodes.remove(index);
+                    self.plan.nodes.push(node);
                 }
                 if let Some(id) = remove_node {
                     self.plan.remove_node(id);
+                    self.count_edits.remove(&id);
+                    self.output_edits.remove(&id);
                     if self.selected_node == Some(id) {
                         self.selected_node = None;
                     }
                 }
 
-                if let (Some(origin), Some(cursor)) = (&self.dragged_port, pointer) {
-                    if let Some(start) = self.port_screen_position(origin, canvas_rect) {
-                        let color = if hovered_port
-                            .as_ref()
-                            .is_some_and(|target| ports_compatible(origin, target))
-                        {
-                            GREEN
-                        } else {
-                            ORANGE
-                        };
-                        let (from, to) = if origin.side == PortSide::Output {
-                            (start, cursor)
-                        } else {
-                            (cursor, start)
-                        };
-                        draw_connection(&painter, from, to, color, 3.0);
-                    }
+                if let (Some(origin), Some(cursor)) = (&self.dragged_port, pointer)
+                    && let Some(start) = self.port_screen_position(origin, canvas_rect)
+                {
+                    let color = if hovered_port
+                        .as_ref()
+                        .is_some_and(|target| ports_compatible(origin, target))
+                    {
+                        GREEN
+                    } else {
+                        ORANGE
+                    };
+                    let (from, to) = if origin.side == PortSide::Output {
+                        (start, cursor)
+                    } else {
+                        (cursor, start)
+                    };
+                    draw_connection(&painter, from, to, color, 3.0);
                 }
 
                 let primary_down = ctx.input(|i| i.pointer.primary_down());
@@ -775,14 +890,18 @@ impl eframe::App for PlannerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.top_bar(ctx);
         self.recipe_library(ctx);
-        self.summary_panel(ctx);
-        self.canvas(ctx);
+        let evaluation = self.plan.evaluate(&self.data);
+        self.summary_panel(ctx, &evaluation);
+        let evaluation = self.plan.evaluate(&self.data);
+        self.canvas(ctx, &evaluation);
         self.recipe_chooser(ctx);
 
         if node_delete_requested(ctx)
             && let Some(id) = self.selected_node.take()
         {
             self.plan.remove_node(id);
+            self.count_edits.remove(&id);
+            self.output_edits.remove(&id);
         }
         ctx.request_repaint();
     }
@@ -812,6 +931,7 @@ fn node_size(recipe: &Recipe) -> Vec2 {
     Vec2::new(NODE_WIDTH, NODE_HEADER + rows * PORT_ROW + NODE_FOOTER)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_node(
     painter: &egui::Painter,
     rect: Rect,
@@ -819,6 +939,7 @@ fn draw_node(
     node: &crate::model::PlanNode,
     data: &GameData,
     plan: &Plan,
+    evaluation: &PlanEvaluation,
     selected: bool,
     zoom: f32,
 ) {
@@ -873,8 +994,6 @@ fn draw_node(
         MUTED,
     );
 
-    let speed = machine.map_or(1.0, |m| m.speed);
-    let factor = speed * node.clock_percent / 100.0 * node.machines;
     for (side, ingredients) in [
         (PortSide::Input, &recipe.inputs),
         (PortSide::Output, &recipe.outputs),
@@ -894,7 +1013,7 @@ fn draw_node(
             };
             let connected = plan.is_connected(&port);
             let color = if connected {
-                CYAN
+                connection_color(evaluation.port_connection_state(&port, plan))
             } else if side == PortSide::Input {
                 RED
             } else {
@@ -906,7 +1025,6 @@ fn draw_node(
                 (PORT_RADIUS + 2.0) * zoom.max(0.72),
                 Stroke::new(1.0_f32, color.gamma_multiply(0.45)),
             );
-            let rate = recipe.base_rate(ingredient) * factor;
             let item_name = data.item_name(&ingredient.item);
             let (pos, align) = if side == PortSide::Input {
                 (Pos2::new(x + 15.0 * zoom, y), Align2::LEFT_CENTER)
@@ -920,35 +1038,41 @@ fn draw_node(
                 FontId::proportional(12.5 * zoom),
                 TEXT,
             );
-            let rate_pos = pos + Vec2::new(0.0, 15.0 * zoom);
-            painter.text(
-                rate_pos,
-                align,
-                format!("{}/min", format_rate(rate)),
-                FontId::proportional(10.5 * zoom),
-                color,
-            );
+            if let Some(rate) = evaluation.port_rate(&port, plan, data) {
+                let rate_pos = pos + Vec2::new(0.0, 15.0 * zoom);
+                painter.text(
+                    rate_pos,
+                    align,
+                    format!("{}/min", format_rate(rate)),
+                    FontId::proportional(10.5 * zoom),
+                    color,
+                );
+            }
         }
     }
     let footer_y = rect.bottom() - 24.0 * zoom;
-    let power = machine.map_or(0.0, |m| {
-        m.power_kw * node.machines * node.clock_percent / 100.0
-    });
+    let calculation = evaluation.node(node.id);
+    let status = if node.pinned_primary_rate.is_some() {
+        "PINNED"
+    } else {
+        "AUTO"
+    };
+    let count = calculation
+        .map(|value| format_number(value.machines))
+        .unwrap_or_else(|| "—".into());
     painter.text(
         Pos2::new(rect.left() + 14.0 * zoom, footer_y),
         Align2::LEFT_CENTER,
-        format!(
-            "{} ×  {:.0}%",
-            format_number(node.machines),
-            node.clock_percent
-        ),
+        format!("{status}  •  {count} ×  {:.0}%", node.clock_percent),
         FontId::proportional(11.5 * zoom),
         MUTED,
     );
     painter.text(
         Pos2::new(rect.right() - 14.0 * zoom, footer_y),
         Align2::RIGHT_CENTER,
-        format_power(power),
+        calculation
+            .map(|value| format_power(value.power_kw))
+            .unwrap_or_else(|| "—".into()),
         FontId::proportional(11.5 * zoom),
         ORANGE,
     );
@@ -1011,6 +1135,49 @@ fn ports_compatible(a: &PortRef, b: &PortRef) -> bool {
     a.node != b.node && a.side != b.side && a.item == b.item
 }
 
+fn connection_color(state: ConnectionState) -> Color32 {
+    match state {
+        ConnectionState::Balanced => CYAN,
+        ConnectionState::Partial => ORANGE,
+        ConnectionState::Unresolved => MUTED,
+    }
+}
+
+fn optional_number_edit(
+    ui: &mut egui::Ui,
+    id: Id,
+    draft: &mut String,
+    current: Option<f32>,
+    width: f32,
+) -> Option<f32> {
+    let focused = ui.memory(|memory| memory.has_focus(id));
+    if !focused {
+        *draft = current.map(format_edit_number).unwrap_or_default();
+    }
+    let response = ui.add(
+        egui::TextEdit::singleline(draft)
+            .id(id)
+            .hint_text("—")
+            .desired_width(width),
+    );
+    if !response.changed() {
+        return None;
+    }
+    draft
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn format_edit_number(value: f32) -> String {
+    let formatted = format!("{value:.3}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
 fn recipe_matches(recipe: &Recipe, needle: &str, data: &GameData) -> bool {
     if needle.is_empty() {
         return true;
@@ -1058,14 +1225,22 @@ fn flow_section(
     values: &HashMap<String, f32>,
     color: Color32,
     data: &GameData,
+    has_values: bool,
+    has_unresolved: bool,
 ) {
     ui.label(RichText::new(title).strong().color(color));
     ui.add_space(5.0);
     if values.is_empty() {
         ui.label(
-            RichText::new("None — all accounted for")
-                .small()
-                .color(MUTED),
+            RichText::new(if !has_values {
+                "—"
+            } else if has_unresolved {
+                "None among resolved nodes"
+            } else {
+                "None — all accounted for"
+            })
+            .small()
+            .color(MUTED),
         );
         return;
     }

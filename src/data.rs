@@ -142,6 +142,17 @@ pub struct GameData {
 }
 
 impl GameData {
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(recipes: Vec<Recipe>, machines: Vec<Machine>) -> Self {
+        let mut data = Self {
+            recipes,
+            machines,
+            ..Self::default()
+        };
+        data.rebuild_indexes();
+        data
+    }
+
     pub fn load(root: &Path) -> Result<Self, String> {
         let crafting_dir = if root.ends_with("CraftingRecipe") {
             root.to_path_buf()
@@ -172,7 +183,7 @@ impl GameData {
                 .then(a.id.cmp(&b.id))
         });
         data.machines
-            .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            .sort_by_key(|machine| machine.name.to_lowercase());
         data.rebuild_indexes();
         Ok(data)
     }

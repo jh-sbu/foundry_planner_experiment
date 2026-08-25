@@ -34,7 +34,12 @@ explaining how to configure the path.
 - Drag a red input port onto empty space to choose a recipe that produces it.
 - Drag a green output port onto empty space to choose a recipe that consumes it.
 - Ports can also be dragged directly onto a matching port on another node.
-- Select a node to change its building, machine count, or clock speed.
+- Select a node to change its building or clock speed. Enter either a machine
+  count or primary output rate to pin that output; editing either value updates
+  the other. Use `Unpin` to let connected pinned nodes calculate it again.
+- New nodes start unpinned. A connected component shows production values only
+  after at least one node is pinned. Balanced links are cyan, partial links are
+  orange, and unresolved links are gray.
 - Unconnected inputs and outputs, total machine count, and power are summarized on
   the right. Use `Fit plan` to frame the entire graph.
 - Select a node and press Delete/Backspace, or use the `×` on the node, to remove it.
