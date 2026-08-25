@@ -6,9 +6,10 @@ use eframe::egui::{
 };
 
 use crate::{
-    data::{GameData, Recipe, TEMPLATE_ROOT_ENV, resolve_template_root},
+    data::{GameData, Recipe, RecipeKind, TEMPLATE_ROOT_ENV, resolve_template_root},
     model::{
-        ConnectionState, NodeId, Plan, PlanEvaluation, PortRef, PortSide,
+        BlastFurnaceSettings, ConnectionState, NodeId, Plan, PlanEvaluation, PortRef, PortSide,
+        blast_furnace_config, blast_furnace_hot_air_rate, blast_furnace_operating_speed,
         primary_rate_for_machine_count,
     },
 };
@@ -216,12 +217,7 @@ impl PlannerApp {
                             if !recipe_matches(recipe, &needle, &self.data) {
                                 continue;
                             }
-                            let machine = self
-                                .data
-                                .machine_options(recipe)
-                                .first()
-                                .map(|m| m.name.as_str())
-                                .unwrap_or("Manual / special");
+                            let machine_summary = recipe_machine_summary(recipe, &self.data);
                             let response = egui::Frame::new()
                                 .fill(CARD)
                                 .corner_radius(6)
@@ -235,12 +231,7 @@ impl PlannerApp {
                                                 RichText::new(&recipe.name).strong().color(TEXT),
                                             );
                                             ui.label(
-                                                RichText::new(format!(
-                                                    "{}  •  {:.1}s",
-                                                    machine, recipe.time_seconds
-                                                ))
-                                                .small()
-                                                .color(MUTED),
+                                                RichText::new(machine_summary).small().color(MUTED),
                                             );
                                             ui.label(
                                                 RichText::new(recipe_flow_summary(
@@ -413,15 +404,48 @@ impl PlannerApp {
                         });
                 }
                 ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label("Clock");
-                    ui.add(
-                        egui::DragValue::new(&mut self.plan.nodes[index].clock_percent)
-                            .range(1.0..=250.0)
-                            .suffix("%")
-                            .speed(1.0),
-                    );
-                });
+                let furnace_config =
+                    blast_furnace_config(&self.plan.nodes[index], &self.data).cloned();
+                if let Some(config) = &furnace_config {
+                    let settings =
+                        self.plan.nodes[index]
+                            .blast_furnace
+                            .get_or_insert(BlastFurnaceSettings {
+                                towers: config.max_towers,
+                                temperature: config.optimal_temperature,
+                            });
+                    settings.towers = settings.towers.clamp(config.min_towers, config.max_towers);
+                    settings.temperature = settings
+                        .temperature
+                        .clamp(config.min_temperature, config.optimal_temperature);
+                    ui.horizontal(|ui| {
+                        ui.label("Towers");
+                        ui.add(
+                            egui::DragValue::new(&mut settings.towers)
+                                .range(config.min_towers..=config.max_towers)
+                                .speed(1.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Temperature");
+                        ui.add(
+                            egui::DragValue::new(&mut settings.temperature)
+                                .range(config.min_temperature..=config.optimal_temperature)
+                                .suffix("°C")
+                                .speed(5.0),
+                        );
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label("Clock");
+                        ui.add(
+                            egui::DragValue::new(&mut self.plan.nodes[index].clock_percent)
+                                .range(1.0..=250.0)
+                                .suffix("%")
+                                .speed(1.0),
+                        );
+                    });
+                }
                 let calculation = evaluation.node(selected).copied();
                 let count_value = calculation.map(|value| value.machines);
                 let output_value = calculation.map(|value| value.primary_rate);
@@ -478,15 +502,32 @@ impl PlannerApp {
                     .as_deref()
                     .and_then(|id| self.data.machine(id))
                 {
-                    let factor = machine.speed * self.plan.nodes[index].clock_percent / 100.0;
-                    ui.label(
-                        RichText::new(format!(
-                            "×{factor:.2} recipe speed  •  {} each",
-                            format_power(machine.power_kw)
-                        ))
-                        .small()
-                        .color(CYAN),
-                    );
+                    if furnace_config.is_some() {
+                        let speed =
+                            blast_furnace_operating_speed(&self.plan.nodes[index], &self.data)
+                                .unwrap_or(0.0);
+                        let hot_air =
+                            blast_furnace_hot_air_rate(&self.plan.nodes[index], &self.data)
+                                .unwrap_or(0.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "×{speed:.2} operating speed  •  {}/min hot air each",
+                                format_rate(hot_air)
+                            ))
+                            .small()
+                            .color(CYAN),
+                        );
+                    } else {
+                        let factor = machine.speed * self.plan.nodes[index].clock_percent / 100.0;
+                        ui.label(
+                            RichText::new(format!(
+                                "×{factor:.2} recipe speed  •  {} each",
+                                format_power(machine.power_kw)
+                            ))
+                            .small()
+                            .color(CYAN),
+                        );
+                    }
                 }
             });
     }
@@ -762,19 +803,14 @@ impl PlannerApp {
                             if !recipe_matches(recipe, &needle, &self.data) {
                                 continue;
                             }
-                            let machine = self
-                                .data
-                                .machine_options(recipe)
-                                .first()
-                                .map(|m| m.name.as_str())
-                                .unwrap_or("Manual / special");
+                            let machine_summary = recipe_machine_summary(recipe, &self.data);
                             if ui
                                 .add(
                                     egui::Button::new(
                                         RichText::new(format!(
                                             "{}\n{}  •  {}",
                                             recipe.name,
-                                            machine,
+                                            machine_summary,
                                             recipe_flow_summary(recipe, &self.data)
                                         ))
                                         .color(TEXT),
@@ -968,6 +1004,10 @@ fn draw_node(
         CornerRadius::ZERO,
         ORANGE,
     );
+    let operating_summary = node.blast_furnace.as_ref().map_or_else(
+        || format!("{:.0}%", node.clock_percent),
+        |settings| format!("{} towers • {:.0}°C", settings.towers, settings.temperature),
+    );
     painter.text(
         header.left_top() + Vec2::new(14.0, 12.0) * zoom,
         Align2::LEFT_TOP,
@@ -1063,7 +1103,7 @@ fn draw_node(
     painter.text(
         Pos2::new(rect.left() + 14.0 * zoom, footer_y),
         Align2::LEFT_CENTER,
-        format!("{status}  •  {count} ×  {:.0}%", node.clock_percent),
+        format!("{status}  •  {count} ×  {operating_summary}"),
         FontId::proportional(11.5 * zoom),
         MUTED,
     );
@@ -1210,6 +1250,18 @@ fn recipe_flow_summary(recipe: &Recipe, data: &GameData) -> String {
         if inputs.is_empty() { "—" } else { &inputs },
         if outputs.is_empty() { "—" } else { &outputs }
     )
+}
+
+fn recipe_machine_summary(recipe: &Recipe, data: &GameData) -> String {
+    let machine = data
+        .machine_options(recipe)
+        .first()
+        .map(|machine| machine.name.as_str())
+        .unwrap_or("Manual / special");
+    match recipe.kind {
+        RecipeKind::BlastFurnace { .. } => format!("{machine}  •  configurable"),
+        RecipeKind::Crafting => format!("{machine}  •  {:.1}s", recipe.time_seconds),
+    }
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {

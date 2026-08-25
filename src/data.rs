@@ -103,6 +103,15 @@ pub struct Ingredient {
     pub amount: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum RecipeKind {
+    Crafting,
+    BlastFurnace {
+        hot_air_input_slot: usize,
+        shutdown_slag: Option<String>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct Recipe {
     pub id: String,
@@ -112,12 +121,34 @@ pub struct Recipe {
     pub time_seconds: f32,
     pub tags: Vec<String>,
     pub category: String,
+    pub kind: RecipeKind,
 }
 
 impl Recipe {
     pub fn base_rate(&self, ingredient: &Ingredient) -> f32 {
         ingredient.amount * 60.0 / self.time_seconds.max(0.001)
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BlastFurnaceConfig {
+    pub base_speed: f32,
+    pub output_multiplier: f32,
+    pub min_temperature: f32,
+    pub optimal_temperature: f32,
+    pub speed_at_min_temperature: f32,
+    pub hot_air_item: String,
+    pub base_hot_air_per_tick: f32,
+    pub min_towers: u32,
+    pub max_towers: u32,
+    pub tower_speed_increase: f32,
+    pub tower_hot_air_increase: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MachineKind {
+    Crafting,
+    BlastFurnace(BlastFurnaceConfig),
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +158,7 @@ pub struct Machine {
     pub tags: Vec<String>,
     pub speed: f32,
     pub power_kw: f32,
+    pub kind: MachineKind,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -175,6 +207,7 @@ impl GameData {
         data.load_tags(&templates.join("CraftingTag"))?;
         data.load_machines(&templates.join("BuildableObjectTemplate"))?;
         data.load_recipes(&crafting_dir)?;
+        data.load_blast_furnace_modes(&templates.join("BlastFurnaceModeTemplate"))?;
 
         data.recipes.sort_by(|a, b| {
             a.name
@@ -208,7 +241,13 @@ impl GameData {
         let mut result: Vec<_> = self
             .machines
             .iter()
-            .filter(|m| m.tags.iter().any(|tag| tags.contains(tag.as_str())))
+            .filter(|machine| match (&recipe.kind, &machine.kind) {
+                (RecipeKind::BlastFurnace { .. }, MachineKind::BlastFurnace(_)) => true,
+                (RecipeKind::Crafting, MachineKind::Crafting) => {
+                    machine.tags.iter().any(|tag| tags.contains(tag.as_str()))
+                }
+                _ => false,
+            })
             .collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
         result
@@ -299,7 +338,9 @@ impl GameData {
             let Ok(doc) = load_yaml(&path) else { continue };
             for (id, entry) in template_entries(&doc, "BuildableObjectTemplate") {
                 let tags = string_list(entry, "producer_recipeType_tags");
-                if tags.is_empty() {
+                let is_blast_furnace =
+                    string_field(entry, "type").as_deref() == Some("BlastFurnace");
+                if tags.is_empty() && !is_blast_furnace {
                     continue;
                 }
                 let speed = number_field(entry, "producer_recipeTimeModifier_str")
@@ -308,17 +349,65 @@ impl GameData {
                 let power_kw = number_field(entry, "energyConsumptionKW_str")
                     .unwrap_or(0.0)
                     .max(0.0);
-                let name = self
-                    .item_names
-                    .get(&id)
-                    .cloned()
+                let name = string_field(entry, "nameOverride")
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| self.item_names.get(&id).cloned())
                     .unwrap_or_else(|| humanize_id(&id));
+                let kind = if is_blast_furnace {
+                    let tower_id = string_field(entry, "blastFurnace_towerModuleBotIdentifier")
+                        .unwrap_or_default();
+                    let (min_towers, max_towers) =
+                        modular_limit(entry, &tower_id).unwrap_or((1, 1));
+                    MachineKind::BlastFurnace(BlastFurnaceConfig {
+                        base_speed: number_field(entry, "blastFurnace_speedModifier")
+                            .unwrap_or(1.0)
+                            .max(0.0),
+                        // Mode output amounts are the steady-state rates used by the game UI;
+                        // retain this template value as metadata without applying it twice.
+                        output_multiplier: number_field(entry, "blastFurnace_outputMultiplier")
+                            .unwrap_or(1.0)
+                            .max(0.0),
+                        min_temperature: number_field(entry, "blastFurnace_minRunningTemp")
+                            .unwrap_or(0.0),
+                        optimal_temperature: number_field(entry, "blastFurnace_optimalRunningTemp")
+                            .unwrap_or(0.0),
+                        speed_at_min_temperature: number_field(
+                            entry,
+                            "blastFurnace_speedPercentageAtMinRunningTemp",
+                        )
+                        .unwrap_or(0.0)
+                        .max(0.0),
+                        hot_air_item: string_field(entry, "blastFurnace_hotAirTemplateIdentifier")
+                            .unwrap_or_default(),
+                        base_hot_air_per_tick: number_field(
+                            entry,
+                            "blastFurnace_baseHotAirConsumptionPerTick",
+                        )
+                        .unwrap_or(0.0)
+                        .max(0.0),
+                        min_towers,
+                        max_towers: max_towers.max(min_towers),
+                        tower_speed_increase: number_field(
+                            entry,
+                            "blastFurnace_towerModule_speedIncrease",
+                        )
+                        .unwrap_or(0.0),
+                        tower_hot_air_increase: number_field(
+                            entry,
+                            "blastFurnace_towerModule_hotAirConsumptionPercentIncrease",
+                        )
+                        .unwrap_or(0.0),
+                    })
+                } else {
+                    MachineKind::Crafting
+                };
                 self.machines.push(Machine {
                     id,
                     name,
                     tags,
                     speed,
                     power_kw,
+                    kind,
                 });
             }
         }
@@ -362,6 +451,7 @@ impl GameData {
                     time_seconds: time_seconds.max(0.001),
                     tags: string_list(entry, "tags"),
                     category: string_field(entry, "category_identifier").unwrap_or_default(),
+                    kind: RecipeKind::Crafting,
                 });
             }
         }
@@ -370,6 +460,66 @@ impl GameData {
                 "No recipes could be read from {} ({failures} invalid files)",
                 dir.display()
             ));
+        }
+        Ok(())
+    }
+
+    fn load_blast_furnace_modes(&mut self, dir: &Path) -> Result<(), String> {
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        let Some(config) = self
+            .machines
+            .iter()
+            .find_map(|machine| match &machine.kind {
+                MachineKind::BlastFurnace(config) => Some(config.clone()),
+                MachineKind::Crafting => None,
+            })
+        else {
+            return Ok(());
+        };
+
+        for path in yaml_files(dir)? {
+            let Ok(doc) = load_yaml(&path) else { continue };
+            for (id, entry) in template_entries(&doc, "BlastFurnaceModeTemplate") {
+                let mut inputs = ingredient_list(entry, "input_data");
+                let hot_air_input_slot = inputs.len();
+                if !config.hot_air_item.is_empty() && config.base_hot_air_per_tick > 0.0 {
+                    inputs.push(Ingredient {
+                        item: config.hot_air_item.clone(),
+                        amount: config.base_hot_air_per_tick * 3_600.0,
+                    });
+                }
+                let mut outputs = ingredient_list(entry, "output_data_elemental");
+                if let Some(waste_gas) = ingredient(entry, "waste_gas_data") {
+                    outputs.push(Ingredient {
+                        item: waste_gas.item,
+                        amount: waste_gas.amount * 3_600.0,
+                    });
+                }
+                if inputs.is_empty() && outputs.is_empty() {
+                    continue;
+                }
+                let name = outputs
+                    .first()
+                    .map(|output| self.item_name(&output.item))
+                    .or_else(|| string_field(entry, "name"))
+                    .unwrap_or_else(|| humanize_id(&id));
+                self.recipes.push(Recipe {
+                    id,
+                    name,
+                    inputs,
+                    outputs,
+                    time_seconds: 60.0,
+                    tags: Vec::new(),
+                    category: "Blast Furnace".to_owned(),
+                    kind: RecipeKind::BlastFurnace {
+                        hot_air_input_slot,
+                        shutdown_slag: string_field(entry, "slagTemplateIdentifierForShutdown")
+                            .filter(|slag| !slag.is_empty()),
+                    },
+                });
+            }
         }
         Ok(())
     }
@@ -460,6 +610,28 @@ fn ingredient_list(entry: &Yaml, key: &str) -> Vec<Ingredient> {
         .collect()
 }
 
+fn ingredient(entry: &Yaml, key: &str) -> Option<Ingredient> {
+    let item = value(entry, key)?;
+    Some(Ingredient {
+        item: string_field(item, "identifier")?,
+        amount: number_field(item, "amount").or_else(|| number_field(item, "amount_str"))?,
+    })
+    .filter(|ingredient| ingredient.amount > 0.0)
+}
+
+fn modular_limit(entry: &Yaml, identifier: &str) -> Option<(u32, u32)> {
+    value(entry, "modularBuildingLimits")?
+        .as_vec()?
+        .iter()
+        .find(|limit| string_field(limit, "bot_identifier").as_deref() == Some(identifier))
+        .map(|limit| {
+            (
+                number_field(limit, "minAmount").unwrap_or(1.0).max(0.0) as u32,
+                number_field(limit, "maxAmount").unwrap_or(1.0).max(0.0) as u32,
+            )
+        })
+}
+
 pub fn humanize_id(id: &str) -> String {
     let words = id
         .trim_start_matches('_')
@@ -538,6 +710,35 @@ mod tests {
                 .inputs
                 .iter()
                 .any(|i| { i.item == "_base_molten_xf" && (i.amount - 15.0).abs() < f32::EPSILON })
+        );
+
+        let furnace = data
+            .machine("_base_blast_furnace_base_1")
+            .expect("blast furnace building");
+        let MachineKind::BlastFurnace(config) = &furnace.kind else {
+            panic!("blast furnace should have its specialized configuration");
+        };
+        assert_eq!((config.min_towers, config.max_towers), (1, 5));
+        assert!((config.min_temperature - 1_500.0).abs() < f32::EPSILON);
+        assert!((config.optimal_temperature - 2_000.0).abs() < f32::EPSILON);
+        assert!((config.output_multiplier - 4.0).abs() < f32::EPSILON);
+
+        let mode = data
+            .recipe("_base_bfm_xf")
+            .expect("xenoferrite blast furnace mode");
+        assert!(matches!(mode.kind, RecipeKind::BlastFurnace { .. }));
+        assert!(
+            mode.inputs
+                .iter()
+                .any(|input| input.item == "_base_hot_air")
+        );
+        assert!(mode.outputs.iter().any(|output| {
+            output.item == "_base_waste_gas" && (output.amount - 43_200.0).abs() < 0.01
+        }));
+        assert!(
+            data.recipes_producing("_base_molten_xf")
+                .iter()
+                .any(|recipe| recipe.id == "_base_bfm_xf")
         );
     }
 

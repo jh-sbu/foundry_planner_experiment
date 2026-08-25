@@ -3,8 +3,9 @@
 A native production-chain planner for **FOUNDRY**, built with Rust and `egui`.
 
 The app reads the installed game's YAML templates at startup, including recipes,
-item names, compatible production buildings, crafting speeds, and machine power
-consumption. No recipe database is copied into this repository.
+blast furnace modes, item names, compatible production buildings, crafting
+speeds, and machine power consumption. No recipe database is copied into this
+repository.
 
 ## Run
 
@@ -34,9 +35,12 @@ explaining how to configure the path.
 - Drag a red input port onto empty space to choose a recipe that produces it.
 - Drag a green output port onto empty space to choose a recipe that consumes it.
 - Ports can also be dragged directly onto a matching port on another node.
-- Select a node to change its building or clock speed. Enter either a machine
-  count or primary output rate to pin that output; editing either value updates
-  the other. Use `Unpin` to let connected pinned nodes calculate it again.
+- Select a node to change its building or clock speed. Blast furnaces instead
+  expose their 1–5 tower configuration and operating temperature; their solid,
+  elemental, hot-air, slag, and waste-gas rates update from the game template
+  values. Enter either a machine count or primary output rate to pin that output;
+  editing either value updates the other. Use `Unpin` to let connected pinned
+  nodes calculate it again.
 - New nodes start unpinned. A connected component shows production values only
   after at least one node is pinned. Balanced links are cyan, partial links are
   orange, and unresolved links are gray.
@@ -52,5 +56,5 @@ cargo test
 
 Path-resolution tests run on every machine. When FOUNDRY templates are available
 through automatic discovery or `FOUNDRY_TEMPLATE_ROOT`, the tests also parse the
-installed data and exercise the Machinery Parts → Xenoferrite Plates
-production-chain accounting.
+installed data and exercise both ordinary production-chain accounting and the
+Blast Furnace → Molten Xenoferrite → Xenoferrite Plates chain.

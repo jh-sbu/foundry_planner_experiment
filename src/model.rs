@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use eframe::egui::Pos2;
 
-use crate::data::{GameData, Recipe};
+use crate::data::{BlastFurnaceConfig, GameData, MachineKind, Recipe, RecipeKind};
 
 pub type NodeId = u64;
 
@@ -23,6 +23,12 @@ pub struct PortRef {
 }
 
 #[derive(Clone, Debug)]
+pub struct BlastFurnaceSettings {
+    pub towers: u32,
+    pub temperature: f32,
+}
+
+#[derive(Clone, Debug)]
 pub struct PlanNode {
     pub id: NodeId,
     pub recipe_id: String,
@@ -30,6 +36,7 @@ pub struct PlanNode {
     pub position: Pos2,
     pub pinned_primary_rate: Option<f32>,
     pub clock_percent: f32,
+    pub blast_furnace: Option<BlastFurnaceSettings>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,11 +99,11 @@ impl PlanEvaluation {
         let node = plan.nodes.iter().find(|node| node.id == port.node)?;
         let calculation = self.node(node.id)?;
         let recipe = data.recipe(&node.recipe_id)?;
-        let ingredient = match port.side {
+        match port.side {
             PortSide::Input => recipe.inputs.get(port.slot),
             PortSide::Output => recipe.outputs.get(port.slot),
         }?;
-        Some(calculation.primary_rate * rate_ratio(recipe, ingredient))
+        Some(calculation.primary_rate * rate_ratio(node, recipe, port.side, port.slot, data))
     }
 
     pub fn port_connection_state(&self, port: &PortRef, plan: &Plan) -> ConnectionState {
@@ -121,6 +128,16 @@ impl Plan {
                 .first()
                 .map(|machine| machine.id.clone())
         });
+        let blast_furnace = machine_id
+            .as_deref()
+            .and_then(|id| data.machine(id))
+            .and_then(|machine| match &machine.kind {
+                MachineKind::BlastFurnace(config) => Some(BlastFurnaceSettings {
+                    towers: config.max_towers,
+                    temperature: config.optimal_temperature,
+                }),
+                MachineKind::Crafting => None,
+            });
         self.nodes.push(PlanNode {
             id: self.next_id,
             recipe_id: recipe_id.to_owned(),
@@ -128,6 +145,7 @@ impl Plan {
             position,
             pinned_primary_rate: None,
             clock_percent: 100.0,
+            blast_furnace,
         });
         self.next_id
     }
@@ -244,8 +262,11 @@ impl Plan {
                     .machine_id
                     .as_deref()
                     .and_then(|id| data.machine(id))
-                    .map_or(0.0, |machine| {
-                        machine.power_kw * machines * node.clock_percent.max(1.0) / 100.0
+                    .map_or(0.0, |machine| match machine.kind {
+                        MachineKind::Crafting => {
+                            machine.power_kw * machines * node.clock_percent.max(1.0) / 100.0
+                        }
+                        MachineKind::BlastFurnace(_) => machine.power_kw * machines,
                     });
                 evaluation.nodes.insert(
                     *id,
@@ -357,11 +378,11 @@ impl Plan {
     ) -> Option<()> {
         let node = &self.nodes[*node_indexes.get(&port.node)?];
         let recipe = data.recipe(&node.recipe_id)?;
-        let ingredient = match port.side {
+        match port.side {
             PortSide::Input => recipe.inputs.get(port.slot),
             PortSide::Output => recipe.outputs.get(port.slot),
         }?;
-        let ratio = rate_ratio(recipe, ingredient) as f64 * sign;
+        let ratio = rate_ratio(node, recipe, port.side, port.slot, data) as f64 * sign;
         if let Some(rate) = node.pinned_primary_rate {
             *constant += ratio * rate as f64;
         } else if let Some(column) = unknown_columns.get(&node.id) {
@@ -393,7 +414,8 @@ impl Plan {
                         .totals
                         .inputs
                         .entry(ingredient.item.clone())
-                        .or_default() += calculation.primary_rate * rate_ratio(recipe, ingredient);
+                        .or_default() += calculation.primary_rate
+                        * rate_ratio(node, recipe, PortSide::Input, slot, data);
                 }
             }
             for (slot, ingredient) in recipe.outputs.iter().enumerate() {
@@ -408,7 +430,8 @@ impl Plan {
                         .totals
                         .outputs
                         .entry(ingredient.item.clone())
-                        .or_default() += calculation.primary_rate * rate_ratio(recipe, ingredient);
+                        .or_default() += calculation.primary_rate
+                        * rate_ratio(node, recipe, PortSide::Output, slot, data);
                 }
             }
         }
@@ -468,13 +491,7 @@ pub fn primary_rate_for_machine_count(
     machines: f32,
     data: &GameData,
 ) -> Option<f32> {
-    let primary = recipe.outputs.first()?;
-    let speed = node
-        .machine_id
-        .as_deref()
-        .and_then(|id| data.machine(id))
-        .map_or(1.0, |machine| machine.speed);
-    Some(recipe.base_rate(primary) * speed * node.clock_percent.max(1.0) / 100.0 * machines)
+    Some(per_machine_port_rate(node, recipe, PortSide::Output, 0, data)? * machines)
 }
 
 fn machine_count_for_primary_rate(
@@ -487,11 +504,104 @@ fn machine_count_for_primary_rate(
     (one_machine_rate > 0.0).then_some(primary_rate / one_machine_rate)
 }
 
-fn rate_ratio(recipe: &Recipe, ingredient: &crate::data::Ingredient) -> f32 {
-    let Some(primary) = recipe.outputs.first() else {
+fn rate_ratio(
+    node: &PlanNode,
+    recipe: &Recipe,
+    side: PortSide,
+    slot: usize,
+    data: &GameData,
+) -> f32 {
+    let Some(primary_rate) = per_machine_port_rate(node, recipe, PortSide::Output, 0, data) else {
         return 0.0;
     };
-    recipe.base_rate(ingredient) / recipe.base_rate(primary).max(f32::EPSILON)
+    per_machine_port_rate(node, recipe, side, slot, data).unwrap_or(0.0)
+        / primary_rate.max(f32::EPSILON)
+}
+
+fn per_machine_port_rate(
+    node: &PlanNode,
+    recipe: &Recipe,
+    side: PortSide,
+    slot: usize,
+    data: &GameData,
+) -> Option<f32> {
+    let ingredient = match side {
+        PortSide::Input => recipe.inputs.get(slot),
+        PortSide::Output => recipe.outputs.get(slot),
+    }?;
+    let machine = node.machine_id.as_deref().and_then(|id| data.machine(id));
+    match (&recipe.kind, machine.map(|machine| &machine.kind)) {
+        (
+            RecipeKind::BlastFurnace {
+                hot_air_input_slot, ..
+            },
+            Some(MachineKind::BlastFurnace(config)),
+        ) if side == PortSide::Input && slot == *hot_air_input_slot => {
+            Some(blast_furnace_hot_air_per_minute(node, config))
+        }
+        (RecipeKind::BlastFurnace { .. }, Some(MachineKind::BlastFurnace(config))) => {
+            Some(recipe.base_rate(ingredient) * blast_furnace_operating_speed_for(node, config))
+        }
+        _ => {
+            let speed = machine.map_or(1.0, |machine| machine.speed);
+            Some(recipe.base_rate(ingredient) * speed * node.clock_percent.max(1.0) / 100.0)
+        }
+    }
+}
+
+pub fn blast_furnace_config<'a>(
+    node: &PlanNode,
+    data: &'a GameData,
+) -> Option<&'a BlastFurnaceConfig> {
+    match &data.machine(node.machine_id.as_deref()?)?.kind {
+        MachineKind::BlastFurnace(config) => Some(config),
+        MachineKind::Crafting => None,
+    }
+}
+
+pub fn blast_furnace_operating_speed(node: &PlanNode, data: &GameData) -> Option<f32> {
+    Some(blast_furnace_operating_speed_for(
+        node,
+        blast_furnace_config(node, data)?,
+    ))
+}
+
+pub fn blast_furnace_hot_air_rate(node: &PlanNode, data: &GameData) -> Option<f32> {
+    Some(blast_furnace_hot_air_per_minute(
+        node,
+        blast_furnace_config(node, data)?,
+    ))
+}
+
+fn blast_furnace_operating_speed_for(node: &PlanNode, config: &BlastFurnaceConfig) -> f32 {
+    let towers = furnace_towers(node, config);
+    let optional_towers = towers.saturating_sub(config.min_towers) as f32;
+    let max_speed = config.base_speed + optional_towers * config.tower_speed_increase;
+    let temperature = node
+        .blast_furnace
+        .as_ref()
+        .map_or(config.optimal_temperature, |settings| settings.temperature)
+        .clamp(config.min_temperature, config.optimal_temperature);
+    let range = config.optimal_temperature - config.min_temperature;
+    if range <= f32::EPSILON {
+        return max_speed.max(0.0);
+    }
+    let fraction = (temperature - config.min_temperature) / range;
+    (config.speed_at_min_temperature + fraction * (max_speed - config.speed_at_min_temperature))
+        .max(0.0)
+}
+
+fn blast_furnace_hot_air_per_minute(node: &PlanNode, config: &BlastFurnaceConfig) -> f32 {
+    let towers = furnace_towers(node, config);
+    let optional_towers = towers.saturating_sub(config.min_towers) as f32;
+    config.base_hot_air_per_tick * 3_600.0 * (1.0 + optional_towers * config.tower_hot_air_increase)
+}
+
+fn furnace_towers(node: &PlanNode, config: &BlastFurnaceConfig) -> u32 {
+    node.blast_furnace
+        .as_ref()
+        .map_or(config.max_towers, |settings| settings.towers)
+        .clamp(config.min_towers, config.max_towers)
 }
 
 fn solve_unique_values(equations: Vec<(Vec<f64>, f64)>, variable_count: usize) -> Vec<Option<f64>> {
@@ -582,7 +692,9 @@ fn solve_unique_values(equations: Vec<(Vec<f64>, f64)>, variable_count: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::{Ingredient, Machine, resolve_template_root};
+    use crate::data::{
+        BlastFurnaceConfig, Ingredient, Machine, MachineKind, RecipeKind, resolve_template_root,
+    };
 
     fn recipe(
         id: &str,
@@ -609,6 +721,7 @@ mod tests {
             time_seconds: 60.0,
             tags: vec!["test".into()],
             category: String::new(),
+            kind: RecipeKind::Crafting,
         }
     }
 
@@ -621,6 +734,75 @@ mod tests {
                 tags: vec!["test".into()],
                 speed: 1.0,
                 power_kw: 10.0,
+                kind: MachineKind::Crafting,
+            }],
+        )
+    }
+
+    fn blast_furnace_data() -> GameData {
+        GameData::from_test_parts(
+            vec![Recipe {
+                id: "blast_xf".into(),
+                name: "Molten Xenoferrite".into(),
+                inputs: vec![
+                    Ingredient {
+                        item: "ore".into(),
+                        amount: 640.0,
+                    },
+                    Ingredient {
+                        item: "coke".into(),
+                        amount: 320.0,
+                    },
+                    Ingredient {
+                        item: "rock".into(),
+                        amount: 128.0,
+                    },
+                    Ingredient {
+                        item: "hot_air".into(),
+                        amount: 216_000.0,
+                    },
+                ],
+                outputs: vec![
+                    Ingredient {
+                        item: "molten".into(),
+                        amount: 5_760.0,
+                    },
+                    Ingredient {
+                        item: "slag".into(),
+                        amount: 640.0,
+                    },
+                    Ingredient {
+                        item: "waste_gas".into(),
+                        amount: 43_200.0,
+                    },
+                ],
+                time_seconds: 60.0,
+                tags: Vec::new(),
+                category: "Blast Furnace".into(),
+                kind: RecipeKind::BlastFurnace {
+                    hot_air_input_slot: 3,
+                    shutdown_slag: Some("slag".into()),
+                },
+            }],
+            vec![Machine {
+                id: "blast_furnace".into(),
+                name: "Blast Furnace".into(),
+                tags: Vec::new(),
+                speed: 1.0,
+                power_kw: 0.0,
+                kind: MachineKind::BlastFurnace(BlastFurnaceConfig {
+                    base_speed: 1.0,
+                    output_multiplier: 4.0,
+                    min_temperature: 1_500.0,
+                    optimal_temperature: 2_000.0,
+                    speed_at_min_temperature: 0.5,
+                    hot_air_item: "hot_air".into(),
+                    base_hot_air_per_tick: 60.0,
+                    min_towers: 1,
+                    max_towers: 5,
+                    tower_speed_increase: 0.25,
+                    tower_hot_air_increase: 0.125,
+                }),
             }],
         )
     }
@@ -640,6 +822,105 @@ mod tests {
             .find(|node| node.id == id)
             .unwrap()
             .pinned_primary_rate = Some(primary_rate);
+    }
+
+    fn evaluated_rate(
+        evaluation: &PlanEvaluation,
+        plan: &Plan,
+        data: &GameData,
+        node: NodeId,
+        side: PortSide,
+        slot: usize,
+    ) -> f32 {
+        let recipe = data.recipe("blast_xf").unwrap();
+        let ingredient = match side {
+            PortSide::Input => &recipe.inputs[slot],
+            PortSide::Output => &recipe.outputs[slot],
+        };
+        evaluation
+            .port_rate(
+                &PortRef {
+                    node,
+                    side,
+                    slot,
+                    item: ingredient.item.clone(),
+                },
+                plan,
+                data,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn blast_furnace_rates_follow_towers_and_temperature() {
+        let data = blast_furnace_data();
+        let mut plan = Plan::default();
+        let node = plan.add_recipe("blast_xf", Pos2::ZERO, &data);
+        let recipe = data.recipe("blast_xf").unwrap();
+
+        let rate = primary_rate_for_machine_count(&plan.nodes[0], recipe, 1.0, &data).unwrap();
+        assert!((rate - 11_520.0).abs() < 0.01);
+        pin(&mut plan, node, rate);
+        let evaluation = plan.evaluate(&data);
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Input, 0) - 1_280.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Input, 1) - 640.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Input, 2) - 256.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Input, 3) - 324_000.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Output, 1) - 1_280.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Output, 2) - 86_400.0).abs()
+                < 0.01
+        );
+
+        plan.nodes[0].blast_furnace.as_mut().unwrap().towers = 1;
+        let pinned_evaluation = plan.evaluate(&data);
+        assert!((pinned_evaluation.node(node).unwrap().primary_rate - 11_520.0).abs() < 0.01);
+        assert!((pinned_evaluation.node(node).unwrap().machines - 2.0).abs() < 0.01);
+        let one_tower_rate =
+            primary_rate_for_machine_count(&plan.nodes[0], recipe, 1.0, &data).unwrap();
+        assert!((one_tower_rate - 5_760.0).abs() < 0.01);
+        pin(&mut plan, node, one_tower_rate);
+        let evaluation = plan.evaluate(&data);
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Input, 3) - 216_000.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Output, 2) - 43_200.0).abs()
+                < 0.01
+        );
+
+        let settings = plan.nodes[0].blast_furnace.as_mut().unwrap();
+        settings.towers = 5;
+        settings.temperature = 1_500.0;
+        let minimum_temperature_rate =
+            primary_rate_for_machine_count(&plan.nodes[0], recipe, 1.0, &data).unwrap();
+        assert!((minimum_temperature_rate - 2_880.0).abs() < 0.01);
+        pin(&mut plan, node, minimum_temperature_rate);
+        let evaluation = plan.evaluate(&data);
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Input, 3) - 324_000.0).abs()
+                < 0.01
+        );
+        assert!(
+            (evaluated_rate(&evaluation, &plan, &data, node, PortSide::Output, 2) - 21_600.0).abs()
+                < 0.01
+        );
     }
 
     #[test]
@@ -836,6 +1117,7 @@ mod tests {
                 tags: vec!["test".into()],
                 speed: 2.0,
                 power_kw: 10.0,
+                kind: MachineKind::Crafting,
             }],
         );
         let mut plan = Plan::default();
@@ -889,5 +1171,60 @@ mod tests {
         let parts = evaluation.node(parts).unwrap();
         assert!((parts.primary_rate - 300.0).abs() < 0.01);
         assert!((parts.machines - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn installed_blast_furnace_connects_to_tier_three_plates_when_available() {
+        let Ok(root) = resolve_template_root() else {
+            return;
+        };
+        let data = GameData::load(&root).unwrap();
+        let mut plan = Plan::default();
+        let furnace = plan.add_recipe("_base_bfm_xf", Pos2::ZERO, &data);
+        let plates = plan.add_recipe("_base_xf_plates_t3", Pos2::ZERO, &data);
+        let plate_recipe = data.recipe("_base_xf_plates_t3").unwrap();
+        let molten_input = plate_recipe
+            .inputs
+            .iter()
+            .position(|ingredient| ingredient.item == "_base_molten_xf")
+            .unwrap();
+        let molten_output = data
+            .recipe("_base_bfm_xf")
+            .unwrap()
+            .outputs
+            .iter()
+            .position(|ingredient| ingredient.item == "_base_molten_xf")
+            .unwrap();
+        let plate_rate =
+            primary_rate_for_machine_count(&plan.nodes[1], plate_recipe, 1.0, &data).unwrap();
+        pin(&mut plan, plates, plate_rate);
+        assert!(plan.connect(
+            PortRef {
+                node: furnace,
+                side: PortSide::Output,
+                slot: molten_output,
+                item: "_base_molten_xf".into(),
+            },
+            PortRef {
+                node: plates,
+                side: PortSide::Input,
+                slot: molten_input,
+                item: "_base_molten_xf".into(),
+            },
+        ));
+
+        let evaluation = plan.evaluate(&data);
+        assert!(evaluation.node(furnace).is_some());
+        assert!(evaluation.node(plates).is_some());
+        assert_eq!(evaluation.unresolved_nodes, 0);
+        assert_eq!(
+            evaluation.connection_state(&PortRef {
+                node: furnace,
+                side: PortSide::Output,
+                slot: molten_output,
+                item: "_base_molten_xf".into(),
+            }),
+            ConnectionState::Balanced
+        );
     }
 }
