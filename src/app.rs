@@ -779,13 +779,18 @@ impl eframe::App for PlannerApp {
         self.canvas(ctx);
         self.recipe_chooser(ctx);
 
-        if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
-            if let Some(id) = self.selected_node.take() {
-                self.plan.remove_node(id);
-            }
+        if node_delete_requested(ctx)
+            && let Some(id) = self.selected_node.take()
+        {
+            self.plan.remove_node(id);
         }
         ctx.request_repaint();
     }
+}
+
+fn node_delete_requested(ctx: &egui::Context) -> bool {
+    !ctx.wants_keyboard_input()
+        && ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace))
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -1102,5 +1107,51 @@ fn format_power(kw: f32) -> String {
         format!("{:.2} MW", kw / 1000.0)
     } else {
         format!("{:.0} kW", kw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key_input(key: Key) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input
+    }
+
+    fn delete_requested_for(key: Key, keyboard_focused: bool) -> bool {
+        let ctx = egui::Context::default();
+        let mut requested = false;
+        let _ = ctx.run(key_input(key), |ctx| {
+            if keyboard_focused {
+                ctx.memory_mut(|memory| memory.request_focus(Id::new("focused_editor")));
+            }
+            requested = node_delete_requested(ctx);
+        });
+        requested
+    }
+
+    #[test]
+    fn keyboard_focus_suppresses_node_deletion_shortcuts() {
+        assert!(!delete_requested_for(Key::Backspace, true));
+        assert!(!delete_requested_for(Key::Delete, true));
+    }
+
+    #[test]
+    fn node_deletion_shortcuts_work_without_keyboard_focus() {
+        assert!(delete_requested_for(Key::Backspace, false));
+        assert!(delete_requested_for(Key::Delete, false));
+    }
+
+    #[test]
+    fn unrelated_keys_do_not_request_node_deletion() {
+        assert!(!delete_requested_for(Key::Enter, false));
     }
 }
