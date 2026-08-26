@@ -693,7 +693,8 @@ fn solve_unique_values(equations: Vec<(Vec<f64>, f64)>, variable_count: usize) -
 mod tests {
     use super::*;
     use crate::data::{
-        BlastFurnaceConfig, Ingredient, Machine, MachineKind, RecipeKind, resolve_template_root,
+        BlastFurnaceConfig, Ingredient, Machine, MachineKind, MachineRecipeSelector, RecipeKind,
+        resolve_template_root,
     };
 
     fn recipe(
@@ -731,7 +732,10 @@ mod tests {
             vec![Machine {
                 id: "machine".into(),
                 name: "Machine".into(),
-                tags: vec!["test".into()],
+                recipe_selector: MachineRecipeSelector {
+                    tags: vec!["test".into()],
+                    recipe_ids: Vec::new(),
+                },
                 speed: 1.0,
                 power_kw: 10.0,
                 kind: MachineKind::Crafting,
@@ -787,7 +791,7 @@ mod tests {
             vec![Machine {
                 id: "blast_furnace".into(),
                 name: "Blast Furnace".into(),
-                tags: Vec::new(),
+                recipe_selector: MachineRecipeSelector::default(),
                 speed: 1.0,
                 power_kw: 0.0,
                 kind: MachineKind::BlastFurnace(BlastFurnaceConfig {
@@ -1114,7 +1118,10 @@ mod tests {
             vec![Machine {
                 id: "machine".into(),
                 name: "Machine".into(),
-                tags: vec!["test".into()],
+                recipe_selector: MachineRecipeSelector {
+                    tags: vec!["test".into()],
+                    recipe_ids: Vec::new(),
+                },
                 speed: 2.0,
                 power_kw: 10.0,
                 kind: MachineKind::Crafting,

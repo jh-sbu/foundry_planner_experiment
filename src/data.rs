@@ -151,11 +151,31 @@ pub enum MachineKind {
     BlastFurnace(BlastFurnaceConfig),
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MachineRecipeSelector {
+    pub tags: Vec<String>,
+    pub recipe_ids: Vec<String>,
+}
+
+impl MachineRecipeSelector {
+    fn matches(&self, recipe: &Recipe, recipe_tags: &BTreeSet<&str>) -> bool {
+        self.recipe_ids.iter().any(|id| id == &recipe.id)
+            || self
+                .tags
+                .iter()
+                .any(|tag| recipe_tags.contains(tag.as_str()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tags.is_empty() && self.recipe_ids.is_empty()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Machine {
     pub id: String,
     pub name: String,
-    pub tags: Vec<String>,
+    pub recipe_selector: MachineRecipeSelector,
     pub speed: f32,
     pub power_kw: f32,
     pub kind: MachineKind,
@@ -244,7 +264,7 @@ impl GameData {
             .filter(|machine| match (&recipe.kind, &machine.kind) {
                 (RecipeKind::BlastFurnace { .. }, MachineKind::BlastFurnace(_)) => true,
                 (RecipeKind::Crafting, MachineKind::Crafting) => {
-                    machine.tags.iter().any(|tag| tags.contains(tag.as_str()))
+                    machine.recipe_selector.matches(recipe, &tags)
                 }
                 _ => false,
             })
@@ -337,15 +357,14 @@ impl GameData {
         for path in yaml_files(dir)? {
             let Ok(doc) = load_yaml(&path) else { continue };
             for (id, entry) in template_entries(&doc, "BuildableObjectTemplate") {
-                let tags = string_list(entry, "producer_recipeType_tags");
-                let is_blast_furnace =
-                    string_field(entry, "type").as_deref() == Some("BlastFurnace");
-                if tags.is_empty() && !is_blast_furnace {
+                let buildable_type = string_field(entry, "type").unwrap_or_default();
+                let is_blast_furnace = buildable_type == "BlastFurnace";
+                let crafting_profile = crafting_machine_profile(entry, &buildable_type);
+                if !is_blast_furnace && crafting_profile.is_none() {
                     continue;
                 }
-                let speed = number_field(entry, "producer_recipeTimeModifier_str")
-                    .unwrap_or(1.0)
-                    .max(0.01);
+                let (recipe_selector, speed) =
+                    crafting_profile.unwrap_or_else(|| (MachineRecipeSelector::default(), 1.0));
                 let power_kw = number_field(entry, "energyConsumptionKW_str")
                     .unwrap_or(0.0)
                     .max(0.0);
@@ -404,7 +423,7 @@ impl GameData {
                 self.machines.push(Machine {
                     id,
                     name,
-                    tags,
+                    recipe_selector,
                     speed,
                     power_kw,
                     kind,
@@ -525,6 +544,64 @@ impl GameData {
     }
 }
 
+fn crafting_machine_profile(
+    entry: &Yaml,
+    buildable_type: &str,
+) -> Option<(MachineRecipeSelector, f32)> {
+    let (selector, speed) = match buildable_type {
+        "Producer" => {
+            let selector = match string_field(entry, "producerRecipeType").as_deref() {
+                Some("Tags") => MachineRecipeSelector {
+                    tags: string_list(entry, "producer_recipeType_tags"),
+                    recipe_ids: Vec::new(),
+                },
+                Some("Fixed") => MachineRecipeSelector {
+                    tags: Vec::new(),
+                    recipe_ids: non_empty_string_field(entry, "producer_recipeType_fixed")
+                        .into_iter()
+                        .collect(),
+                },
+                _ => return None,
+            };
+            (
+                selector,
+                number_field(entry, "producer_recipeTimeModifier_str"),
+            )
+        }
+        "AutoProducer" => (
+            MachineRecipeSelector {
+                tags: non_empty_string_field(entry, "autoProducer_recipeType_tag")
+                    .into_iter()
+                    .collect(),
+                recipe_ids: Vec::new(),
+            },
+            number_field(entry, "autoProducer_recipeTimeModifier_str"),
+        ),
+        "ModularEntityProducer" => (
+            MachineRecipeSelector {
+                tags: string_list(entry, "modularProducer_recipeType_tags"),
+                recipe_ids: non_empty_string_field(
+                    entry,
+                    "modularProducer_fixedCraftingRecipeIdentifier",
+                )
+                .into_iter()
+                .collect(),
+            },
+            number_field(entry, "modularProducer_recipeTimeModifier_str"),
+        ),
+        "BaseStation" => (
+            MachineRecipeSelector {
+                tags: Vec::new(),
+                recipe_ids: string_list(entry, "baseStation_craftingRecipeIdentifier"),
+            },
+            Some(1.0),
+        ),
+        _ => return None,
+    };
+
+    (!selector.is_empty()).then_some((selector, speed.unwrap_or(1.0).max(0.01)))
+}
+
 fn yaml_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut files = Vec::new();
     let entries =
@@ -575,6 +652,10 @@ fn string_field(entry: &Yaml, key: &str) -> Option<String> {
         Yaml::Real(value) => Some(value.clone()),
         _ => None,
     }
+}
+
+fn non_empty_string_field(entry: &Yaml, key: &str) -> Option<String> {
+    string_field(entry, key).filter(|value| !value.is_empty())
 }
 
 fn number_field(entry: &Yaml, key: &str) -> Option<f32> {
@@ -655,6 +736,20 @@ pub fn humanize_id(id: &str) -> String {
 mod tests {
     use super::*;
 
+    fn parsed_crafting_profile(yaml: &str) -> Option<(MachineRecipeSelector, f32)> {
+        let doc = YamlLoader::load_from_str(yaml)
+            .expect("test YAML should parse")
+            .into_iter()
+            .next()
+            .expect("test YAML should contain a document");
+        let (_, entry) = template_entries(&doc, "BuildableObjectTemplate")
+            .into_iter()
+            .next()
+            .expect("test YAML should contain a buildable");
+        let buildable_type = string_field(entry, "type").unwrap_or_default();
+        crafting_machine_profile(entry, &buildable_type)
+    }
+
     #[test]
     fn template_root_override_takes_precedence() {
         let override_root = PathBuf::from("custom/templates");
@@ -680,6 +775,105 @@ mod tests {
             .expect_err("missing candidates should return an error");
         assert!(error.contains(TEMPLATE_ROOT_ENV));
         assert!(error.contains("missing/templates"));
+    }
+
+    #[test]
+    fn crafting_machine_profiles_use_fields_for_the_active_type() {
+        let (selector, speed) = parsed_crafting_profile(
+            "BuildableObjectTemplate:\n  auto:\n    type: AutoProducer\n    producer_recipeTimeModifier_str: 9\n    producer_recipeType_tags:\n      - stale\n    autoProducer_recipeTimeModifier_str: 1.5\n    autoProducer_recipeType_tag: advanced_smelter\n",
+        )
+        .expect("auto producer should load");
+        assert_eq!(selector.tags, ["advanced_smelter"]);
+        assert!(selector.recipe_ids.is_empty());
+        assert!((speed - 1.5).abs() < f32::EPSILON);
+
+        let (selector, speed) = parsed_crafting_profile(
+            "BuildableObjectTemplate:\n  modular:\n    type: ModularEntityProducer\n    producer_recipeTimeModifier_str: 9\n    producer_recipeType_tags:\n      - stale\n    modularProducer_fixedCraftingRecipeIdentifier: fixed_recipe\n    modularProducer_recipeTimeModifier_str: 32\n    modularProducer_recipeType_tags:\n      - heavy_caster\n",
+        )
+        .expect("modular producer should load");
+        assert_eq!(selector.tags, ["heavy_caster"]);
+        assert_eq!(selector.recipe_ids, ["fixed_recipe"]);
+        assert!((speed - 32.0).abs() < f32::EPSILON);
+
+        let (selector, speed) = parsed_crafting_profile(
+            "BuildableObjectTemplate:\n  tagged:\n    type: Producer\n    producerRecipeType: Tags\n    producer_recipeTimeModifier_str: 2\n    producer_recipeType_tags:\n      - assembler\n",
+        )
+        .expect("tagged producer should load");
+        assert_eq!(selector.tags, ["assembler"]);
+        assert!(selector.recipe_ids.is_empty());
+        assert!((speed - 2.0).abs() < f32::EPSILON);
+
+        let (selector, speed) = parsed_crafting_profile(
+            "BuildableObjectTemplate:\n  fixed:\n    type: Producer\n    producerRecipeType: Fixed\n    producer_recipeTimeModifier_str: 1\n    producer_recipeType_fixed: fixed_recipe\n",
+        )
+        .expect("fixed producer should load");
+        assert!(selector.tags.is_empty());
+        assert_eq!(selector.recipe_ids, ["fixed_recipe"]);
+        assert!((speed - 1.0).abs() < f32::EPSILON);
+
+        let (selector, speed) = parsed_crafting_profile(
+            "BuildableObjectTemplate:\n  base:\n    type: BaseStation\n    baseStation_craftingRecipeIdentifier:\n      - primitive_plate\n      - primitive_rod\n",
+        )
+        .expect("base station should load");
+        assert!(selector.tags.is_empty());
+        assert_eq!(selector.recipe_ids, ["primitive_plate", "primitive_rod"]);
+        assert!((speed - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn inactive_and_empty_machine_selectors_are_rejected() {
+        assert!(
+            parsed_crafting_profile(
+                "BuildableObjectTemplate:\n  quarry:\n    type: QuarryBuilding\n    producer_recipeType_tags:\n      - smelter\n    autoProducer_recipeType_tag: advanced_smelter\n",
+            )
+            .is_none()
+        );
+        assert!(
+            parsed_crafting_profile(
+                "BuildableObjectTemplate:\n  empty:\n    type: AutoProducer\n    autoProducer_recipeTimeModifier_str: 2\n    autoProducer_recipeType_tag: \"\"\n",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn machine_recipe_selectors_match_tags_or_explicit_recipe_ids() {
+        let recipe = Recipe {
+            id: "fixed_recipe".into(),
+            name: "Fixed Recipe".into(),
+            inputs: Vec::new(),
+            outputs: vec![Ingredient {
+                item: "output".into(),
+                amount: 1.0,
+            }],
+            time_seconds: 1.0,
+            tags: vec!["matching_tag".into()],
+            category: String::new(),
+            kind: RecipeKind::Crafting,
+        };
+        let recipe_tags = recipe.tags.iter().map(String::as_str).collect();
+
+        assert!(
+            MachineRecipeSelector {
+                tags: vec!["matching_tag".into()],
+                recipe_ids: Vec::new(),
+            }
+            .matches(&recipe, &recipe_tags)
+        );
+        assert!(
+            MachineRecipeSelector {
+                tags: Vec::new(),
+                recipe_ids: vec!["fixed_recipe".into()],
+            }
+            .matches(&recipe, &recipe_tags)
+        );
+        assert!(
+            !MachineRecipeSelector {
+                tags: vec!["other_tag".into()],
+                recipe_ids: vec!["other_recipe".into()],
+            }
+            .matches(&recipe, &recipe_tags)
+        );
     }
 
     #[test]
@@ -740,6 +934,59 @@ mod tests {
                 .iter()
                 .any(|recipe| recipe.id == "_base_bfm_xf")
         );
+
+        let steel_tier_two = data.recipe("_base_steel_t2").expect("tier 2 steel recipe");
+        let steel_machines = data.machine_options(steel_tier_two);
+        assert_eq!(steel_machines.len(), 1);
+        assert_eq!(steel_machines[0].id, "_base_smelter_i");
+        assert!((steel_machines[0].speed - 1.5).abs() < f32::EPSILON);
+
+        let firmarlite = data
+            .recipe("_base_firmarlite_sheet_t0")
+            .expect("firmarlite sheet recipe");
+        let lava_smelters = data.machine_options(firmarlite);
+        assert_eq!(lava_smelters.len(), 2);
+        assert!(lava_smelters.iter().any(|machine| {
+            machine.id == "_base_smelter_lava_i" && (machine.speed - 1.0).abs() < f32::EPSILON
+        }));
+        assert!(lava_smelters.iter().any(|machine| {
+            machine.id == "_base_smelter_lava_ii" && (machine.speed - 2.0).abs() < f32::EPSILON
+        }));
+
+        let tier_three_machines = data.machine_options(tier_three);
+        assert!(
+            tier_three_machines
+                .iter()
+                .any(|machine| machine.id == "_base_casting_building_base")
+        );
+        let reactor_mix = data
+            .recipe("_base_npp_press_internal_01")
+            .expect("reactor fuel mix recipe");
+        assert!(
+            data.machine_options(reactor_mix)
+                .iter()
+                .any(|machine| machine.id == "_base_npp_pressurizer_base")
+        );
+        let geothermal = data
+            .recipe("_base_geothermal_generator_internal")
+            .expect("geothermal steam recipe");
+        assert!(
+            data.machine_options(geothermal)
+                .iter()
+                .any(|machine| machine.id == "_base_geothermal_generator_i")
+        );
+        for recipe_id in [
+            "_base_xf_plates_t1_primitive",
+            "_base_technum_rods_t1_primitive",
+        ] {
+            let recipe = data.recipe(recipe_id).expect("base station recipe");
+            assert!(
+                data.machine_options(recipe)
+                    .iter()
+                    .any(|machine| machine.id == "_base_baseStation01")
+            );
+        }
+        assert!(data.machine("_base_quarry_building_i").is_none());
     }
 
     #[test]
