@@ -2,7 +2,8 @@ use std::{collections::HashMap, path::PathBuf};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Id, Key, Margin, PointerButton, Pos2, Rect,
-    RichText, Sense, Stroke, StrokeKind, Vec2,
+    RichText, Sense, Stroke, StrokeKind, TextStyle, Vec2,
+    text::{LayoutJob, TextFormat},
 };
 
 use crate::{
@@ -213,11 +214,9 @@ impl PlannerApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for recipe in &self.data.recipes {
-                            if !recipe_matches(recipe, &needle, &self.data) {
-                                continue;
-                            }
+                        for recipe in matching_recipes(&self.data, &needle) {
                             let machine_summary = recipe_machine_summary(recipe, &self.data);
+                            let flow_summary = recipe_flow_summary(recipe, &self.data);
                             let response = egui::Frame::new()
                                 .fill(CARD)
                                 .corner_radius(6)
@@ -227,19 +226,21 @@ impl PlannerApp {
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
                                             ui.set_width(ui.available_width() - 30.0);
-                                            ui.label(
-                                                RichText::new(&recipe.name).strong().color(TEXT),
-                                            );
+                                            ui.label(highlighted_text(
+                                                &recipe.name,
+                                                &needle,
+                                                TextStyle::Body.resolve(ui.style()),
+                                                TEXT,
+                                            ));
                                             ui.label(
                                                 RichText::new(machine_summary).small().color(MUTED),
                                             );
-                                            ui.label(
-                                                RichText::new(recipe_flow_summary(
-                                                    recipe, &self.data,
-                                                ))
-                                                .small()
-                                                .color(CYAN),
-                                            );
+                                            ui.label(highlighted_text(
+                                                &flow_summary,
+                                                &needle,
+                                                TextStyle::Small.resolve(ui.style()),
+                                                CYAN,
+                                            ));
                                         });
                                         ui.with_layout(
                                             egui::Layout::right_to_left(Align::Center),
@@ -1219,17 +1220,115 @@ fn format_edit_number(value: f32) -> String {
 }
 
 fn recipe_matches(recipe: &Recipe, needle: &str, data: &GameData) -> bool {
+    recipe_match_rank(recipe, needle, data).is_some()
+}
+
+fn matching_recipes<'a>(data: &'a GameData, needle: &str) -> Vec<&'a Recipe> {
+    let mut matches = data
+        .recipes
+        .iter()
+        .filter_map(|recipe| recipe_match_rank(recipe, needle, data).map(|rank| (rank, recipe)))
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(rank, _)| *rank);
+    matches.into_iter().map(|(_, recipe)| recipe).collect()
+}
+
+fn recipe_match_rank(recipe: &Recipe, needle: &str, data: &GameData) -> Option<u8> {
     if needle.is_empty() {
-        return true;
+        return Some(0);
     }
-    recipe.name.to_lowercase().contains(needle)
-        || recipe.id.to_lowercase().contains(needle)
-        || recipe.category.to_lowercase().contains(needle)
-        || recipe
-            .inputs
-            .iter()
-            .chain(&recipe.outputs)
-            .any(|i| data.item_name(&i.item).to_lowercase().contains(needle))
+
+    match_quality(&recipe.name, needle)
+        .or_else(|| {
+            recipe
+                .outputs
+                .iter()
+                .filter_map(|ingredient| match_quality(&data.item_name(&ingredient.item), needle))
+                .min()
+                .map(|quality| 3 + quality)
+        })
+        .or_else(|| {
+            recipe
+                .inputs
+                .iter()
+                .filter_map(|ingredient| match_quality(&data.item_name(&ingredient.item), needle))
+                .min()
+                .map(|quality| 6 + quality)
+        })
+        .or_else(|| match_quality(&recipe.category, needle).map(|quality| 9 + quality))
+        .or_else(|| match_quality(&recipe.id, needle).map(|quality| 12 + quality))
+}
+
+fn match_quality(text: &str, needle: &str) -> Option<u8> {
+    let text = text.to_lowercase();
+    if text == needle {
+        Some(0)
+    } else if text.starts_with(needle) {
+        Some(1)
+    } else if text.contains(needle) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+fn highlighted_text(text: &str, needle: &str, font_id: FontId, color: Color32) -> LayoutJob {
+    let normal = TextFormat {
+        font_id,
+        color,
+        ..Default::default()
+    };
+    let highlighted = TextFormat {
+        color: Color32::BLACK,
+        background: ORANGE,
+        ..normal.clone()
+    };
+    let mut job = LayoutJob::default();
+    let mut cursor = 0;
+
+    for range in case_insensitive_match_ranges(text, needle) {
+        job.append(&text[cursor..range.start], 0.0, normal.clone());
+        job.append(&text[range.clone()], 0.0, highlighted.clone());
+        cursor = range.end;
+    }
+    job.append(&text[cursor..], 0.0, normal);
+    job
+}
+
+fn case_insensitive_match_ranges(text: &str, needle: &str) -> Vec<std::ops::Range<usize>> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut folded = String::new();
+    let mut character_ranges = Vec::new();
+    for (start, character) in text.char_indices() {
+        let folded_start = folded.len();
+        folded.extend(character.to_lowercase());
+        character_ranges.push((
+            folded_start..folded.len(),
+            start..start + character.len_utf8(),
+        ));
+    }
+
+    folded
+        .match_indices(needle)
+        .filter_map(|(start, matched)| {
+            let end = start + matched.len();
+            let original_start = character_ranges
+                .iter()
+                .find(|(folded_range, _)| folded_range.end > start)?
+                .1
+                .start;
+            let original_end = character_ranges
+                .iter()
+                .rev()
+                .find(|(folded_range, _)| folded_range.start < end)?
+                .1
+                .end;
+            Some(original_start..original_end)
+        })
+        .collect()
 }
 
 fn recipe_flow_summary(recipe: &Recipe, data: &GameData) -> String {
@@ -1341,6 +1440,29 @@ fn format_power(kw: f32) -> String {
 mod tests {
     use super::*;
 
+    fn test_recipe(id: &str, name: &str, input: Option<&str>, output: &str) -> Recipe {
+        Recipe {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            inputs: input
+                .map(|item| {
+                    vec![crate::data::Ingredient {
+                        item: item.to_owned(),
+                        amount: 1.0,
+                    }]
+                })
+                .unwrap_or_default(),
+            outputs: vec![crate::data::Ingredient {
+                item: output.to_owned(),
+                amount: 1.0,
+            }],
+            time_seconds: 1.0,
+            tags: Vec::new(),
+            category: String::new(),
+            kind: RecipeKind::Crafting,
+        }
+    }
+
     fn key_input(key: Key) -> egui::RawInput {
         let mut input = egui::RawInput::default();
         input.events.push(egui::Event::Key {
@@ -1380,5 +1502,49 @@ mod tests {
     #[test]
     fn unrelated_keys_do_not_request_node_deletion() {
         assert!(!delete_requested_for(Key::Enter, false));
+    }
+
+    #[test]
+    fn recipe_name_matches_rank_ahead_of_input_only_matches() {
+        let mut data = GameData::from_test_parts(
+            vec![
+                test_recipe(
+                    "assembly_line_rail",
+                    "Assembly Line Rail",
+                    Some("xenoferrite_plates"),
+                    "rail",
+                ),
+                test_recipe(
+                    "plate_recipe",
+                    "Xenoferrite Plates",
+                    Some("molten_xenoferrite"),
+                    "xenoferrite_plates",
+                ),
+            ],
+            Vec::new(),
+        );
+        data.item_names.insert(
+            "xenoferrite_plates".to_owned(),
+            "Xenoferrite Plates".to_owned(),
+        );
+        data.item_names.insert(
+            "molten_xenoferrite".to_owned(),
+            "Molten Xenoferrite".to_owned(),
+        );
+
+        let matches = matching_recipes(&data, "xenoferrite");
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].id, "plate_recipe");
+        assert_eq!(matches[1].id, "assembly_line_rail");
+    }
+
+    #[test]
+    fn highlight_ranges_are_case_insensitive_and_utf8_safe() {
+        assert_eq!(
+            case_insensitive_match_ranges("Xenoferrite Plates", "ferr"),
+            vec![4..8]
+        );
+        assert_eq!(case_insensitive_match_ranges("İnput", "i"), vec![0..2]);
     }
 }
