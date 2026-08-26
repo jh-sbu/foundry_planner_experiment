@@ -7,11 +7,11 @@ use eframe::egui::{
 };
 
 use crate::{
-    data::{GameData, Recipe, RecipeKind, TEMPLATE_ROOT_ENV, resolve_template_root},
+    data::{GameData, MachineKind, Recipe, RecipeKind, TEMPLATE_ROOT_ENV, resolve_template_root},
     model::{
-        BlastFurnaceSettings, ConnectionState, NodeId, Plan, PlanEvaluation, PortRef, PortSide,
-        blast_furnace_config, blast_furnace_hot_air_rate, blast_furnace_operating_speed,
-        primary_rate_for_machine_count,
+        ConnectionState, MachineSettings, NodeId, Plan, PlanEvaluation, PortRef, PortSide,
+        blast_furnace_hot_air_rate, blast_furnace_operating_speed, primary_rate_for_machine_count,
+        recipe_rate_anchor,
     },
 };
 
@@ -288,18 +288,34 @@ impl PlannerApp {
                     .corner_radius(6)
                     .inner_margin(Margin::same(12))
                     .show(ui, |ui| {
+                        let machines = if totals.has_values {
+                            format_number(totals.machine_count)
+                        } else {
+                            "—".into()
+                        };
                         ui.horizontal(|ui| {
-                            let power = if totals.has_values {
-                                format_power(totals.power_kw)
+                            let consumed = if totals.has_values {
+                                format_power(totals.consumed_power_kw)
                             } else {
                                 "—".into()
                             };
-                            let machines = if totals.has_values {
-                                format_number(totals.machine_count)
+                            let generated = if totals.has_values {
+                                format_power(totals.generated_power_kw)
                             } else {
                                 "—".into()
                             };
-                            metric(ui, "POWER", &power, ORANGE);
+                            metric(ui, "USED", &consumed, ORANGE);
+                            ui.separator();
+                            metric(ui, "MADE", &generated, GREEN);
+                        });
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            let net = if totals.has_values {
+                                format_signed_power(totals.net_power_kw)
+                            } else {
+                                "—".into()
+                            };
+                            metric(ui, "NET", &net, CYAN);
                             ui.separator();
                             metric(ui, "MACHINES", &machines, CYAN);
                         });
@@ -381,7 +397,12 @@ impl PlannerApp {
                         );
                     });
                 });
-                let options = self.data.machine_options(recipe);
+                let options: Vec<_> = self
+                    .data
+                    .machine_options(recipe)
+                    .into_iter()
+                    .map(|machine| (machine.id.clone(), machine.name.clone()))
+                    .collect();
                 if options.is_empty() {
                     ui.label(RichText::new("Manual / special crafting").color(MUTED));
                 } else {
@@ -391,61 +412,135 @@ impl PlannerApp {
                         .and_then(|id| self.data.machine(id))
                         .map(|m| m.name.as_str())
                         .unwrap_or("Choose machine");
+                    let mut selected_machine = self.plan.nodes[index].machine_id.clone();
                     egui::ComboBox::from_id_salt(("machine", selected))
                         .selected_text(current_name)
                         .width(ui.available_width())
                         .show_ui(ui, |ui| {
-                            for machine in options {
+                            for (machine_id, machine_name) in &options {
                                 ui.selectable_value(
-                                    &mut self.plan.nodes[index].machine_id,
-                                    Some(machine.id.clone()),
-                                    &machine.name,
+                                    &mut selected_machine,
+                                    Some(machine_id.clone()),
+                                    machine_name,
                                 );
                             }
                         });
+                    if selected_machine != self.plan.nodes[index].machine_id
+                        && let Some(machine_id) = selected_machine
+                    {
+                        self.plan.set_machine(selected, machine_id, &self.data);
+                    }
                 }
                 ui.add_space(6.0);
-                let furnace_config =
-                    blast_furnace_config(&self.plan.nodes[index], &self.data).cloned();
-                if let Some(config) = &furnace_config {
-                    let settings =
-                        self.plan.nodes[index]
-                            .blast_furnace
-                            .get_or_insert(BlastFurnaceSettings {
-                                towers: config.max_towers,
-                                temperature: config.optimal_temperature,
+                let machine_kind = self.plan.nodes[index]
+                    .machine_id
+                    .as_deref()
+                    .and_then(|id| self.data.machine(id))
+                    .map(|machine| machine.kind.clone());
+                match (&machine_kind, &mut self.plan.nodes[index].settings) {
+                    (Some(MachineKind::Crafting), MachineSettings::Clock { percent }) => {
+                        ui.horizontal(|ui| {
+                            ui.label("Clock");
+                            ui.add(
+                                egui::DragValue::new(percent)
+                                    .range(1.0..=250.0)
+                                    .suffix("%")
+                                    .speed(1.0),
+                            );
+                        });
+                    }
+                    (
+                        Some(MachineKind::BlastFurnace(config)),
+                        MachineSettings::BlastFurnace(settings),
+                    ) => {
+                        settings.towers =
+                            settings.towers.clamp(config.min_towers, config.max_towers);
+                        settings.temperature = settings
+                            .temperature
+                            .clamp(config.min_temperature, config.optimal_temperature);
+                        ui.horizontal(|ui| {
+                            ui.label("Towers");
+                            ui.add(
+                                egui::DragValue::new(&mut settings.towers)
+                                    .range(config.min_towers..=config.max_towers)
+                                    .speed(1.0),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Temperature");
+                            ui.add(
+                                egui::DragValue::new(&mut settings.temperature)
+                                    .range(config.min_temperature..=config.optimal_temperature)
+                                    .suffix("°C")
+                                    .speed(5.0),
+                            );
+                        });
+                    }
+                    (
+                        Some(MachineKind::ResourceConverter(config)),
+                        MachineSettings::ResourceConverter { modules, adjacent },
+                    ) => {
+                        *modules = (*modules).clamp(config.min_modules, config.max_modules);
+                        *adjacent = (*adjacent).min(config.max_adjacent);
+                        if config.max_modules > 0 {
+                            ui.horizontal(|ui| {
+                                ui.label("Modules");
+                                ui.add(
+                                    egui::DragValue::new(modules)
+                                        .range(config.min_modules..=config.max_modules)
+                                        .speed(1.0),
+                                );
                             });
-                    settings.towers = settings.towers.clamp(config.min_towers, config.max_towers);
-                    settings.temperature = settings
-                        .temperature
-                        .clamp(config.min_temperature, config.optimal_temperature);
-                    ui.horizontal(|ui| {
-                        ui.label("Towers");
-                        ui.add(
-                            egui::DragValue::new(&mut settings.towers)
-                                .range(config.min_towers..=config.max_towers)
-                                .speed(1.0),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Temperature");
-                        ui.add(
-                            egui::DragValue::new(&mut settings.temperature)
-                                .range(config.min_temperature..=config.optimal_temperature)
-                                .suffix("°C")
-                                .speed(5.0),
-                        );
-                    });
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Clock");
-                        ui.add(
-                            egui::DragValue::new(&mut self.plan.nodes[index].clock_percent)
-                                .range(1.0..=250.0)
-                                .suffix("%")
-                                .speed(1.0),
-                        );
-                    });
+                        }
+                        if config.max_adjacent > 0 {
+                            ui.horizontal(|ui| {
+                                ui.label("Adjacent");
+                                ui.add(
+                                    egui::DragValue::new(adjacent)
+                                        .range(0..=config.max_adjacent)
+                                        .speed(1.0),
+                                );
+                            });
+                        }
+                    }
+                    (
+                        Some(MachineKind::EndlessMiner(config)),
+                        MachineSettings::EndlessMiner { power_cores },
+                    ) => {
+                        *power_cores = (*power_cores).min(config.power_core_slots);
+                        ui.horizontal(|ui| {
+                            ui.label("Power cores");
+                            ui.add(
+                                egui::DragValue::new(power_cores)
+                                    .range(0..=config.power_core_slots)
+                                    .speed(1.0),
+                            );
+                        });
+                    }
+                    (
+                        Some(MachineKind::Reactor),
+                        MachineSettings::Reactor {
+                            utilization_percent,
+                        },
+                    ) => {
+                        *utilization_percent =
+                            (*utilization_percent / 10.0).round().clamp(0.0, 10.0) * 10.0;
+                        ui.horizontal(|ui| {
+                            ui.label("Utilization");
+                            ui.add(
+                                egui::Slider::new(utilization_percent, 0.0..=100.0)
+                                    .step_by(10.0)
+                                    .suffix("%"),
+                            );
+                        });
+                    }
+                    (
+                        Some(MachineKind::AssemblyLine(_)),
+                        MachineSettings::AssemblyLine { painted },
+                    ) => {
+                        ui.checkbox(painted, "Painted finish");
+                    }
+                    _ => {}
                 }
                 let calculation = evaluation.node(selected).copied();
                 let count_value = calculation.map(|value| value.machines);
@@ -468,14 +563,32 @@ impl PlannerApp {
                     ) {
                         self.plan.nodes[index].pinned_primary_rate = Some(rate);
                     }
-                    ui.label("machines");
+                    ui.label(
+                        if matches!(machine_kind, Some(MachineKind::AssemblyLine(_))) {
+                            "lines"
+                        } else {
+                            "machines"
+                        },
+                    );
                 });
-                if let Some(primary) = recipe.outputs.first() {
+                let (anchor_side, anchor_slot) = recipe_rate_anchor(recipe);
+                let primary = match anchor_side {
+                    PortSide::Input => recipe.inputs.get(anchor_slot),
+                    PortSide::Output => recipe.outputs.get(anchor_slot),
+                };
+                if let Some(primary) = primary {
                     let output_name = self.data.item_name(&primary.item);
                     ui.label(
-                        RichText::new(format!("Output — {output_name}"))
-                            .small()
-                            .color(MUTED),
+                        RichText::new(format!(
+                            "{} — {output_name}",
+                            if anchor_side == PortSide::Input {
+                                "Input"
+                            } else {
+                                "Output"
+                            }
+                        ))
+                        .small()
+                        .color(MUTED),
                     );
                     ui.horizontal(|ui| {
                         let draft = self.output_edits.entry(selected).or_default();
@@ -503,7 +616,7 @@ impl PlannerApp {
                     .as_deref()
                     .and_then(|id| self.data.machine(id))
                 {
-                    if furnace_config.is_some() {
+                    if matches!(machine.kind, MachineKind::BlastFurnace(_)) {
                         let speed =
                             blast_furnace_operating_speed(&self.plan.nodes[index], &self.data)
                                 .unwrap_or(0.0);
@@ -518,8 +631,10 @@ impl PlannerApp {
                             .small()
                             .color(CYAN),
                         );
-                    } else {
-                        let factor = machine.speed * self.plan.nodes[index].clock_percent / 100.0;
+                    } else if let MachineSettings::Clock { percent } =
+                        self.plan.nodes[index].settings
+                    {
+                        let factor = machine.speed * percent / 100.0;
                         ui.label(
                             RichText::new(format!(
                                 "×{factor:.2} recipe speed  •  {} each",
@@ -527,6 +642,18 @@ impl PlannerApp {
                             ))
                             .small()
                             .color(CYAN),
+                        );
+                    } else if let Some(required) = &machine.required_resource_node {
+                        let name = self
+                            .data
+                            .resource_node_names
+                            .get(required)
+                            .cloned()
+                            .unwrap_or_else(|| self.data.item_name(required));
+                        ui.label(
+                            RichText::new(format!("Requires {name}"))
+                                .small()
+                                .color(CYAN),
                         );
                     }
                 }
@@ -1005,10 +1132,23 @@ fn draw_node(
         CornerRadius::ZERO,
         ORANGE,
     );
-    let operating_summary = node.blast_furnace.as_ref().map_or_else(
-        || format!("{:.0}%", node.clock_percent),
-        |settings| format!("{} towers • {:.0}°C", settings.towers, settings.temperature),
-    );
+    let operating_summary = match &node.settings {
+        MachineSettings::Clock { percent } => format!("{percent:.0}%"),
+        MachineSettings::BlastFurnace(settings) => {
+            format!("{} towers • {:.0}°C", settings.towers, settings.temperature)
+        }
+        MachineSettings::ResourceConverter { modules, adjacent } => {
+            format!("{modules} modules • {adjacent} adjacent")
+        }
+        MachineSettings::EndlessMiner { power_cores } => format!("{power_cores} cores"),
+        MachineSettings::Reactor {
+            utilization_percent,
+        } => format!("{utilization_percent:.0}%"),
+        MachineSettings::AssemblyLine { painted } => {
+            if *painted { "painted" } else { "metal" }.to_owned()
+        }
+        MachineSettings::Fixed => "fixed".to_owned(),
+    };
     painter.text(
         header.left_top() + Vec2::new(14.0, 12.0) * zoom,
         Align2::LEFT_TOP,
@@ -1112,10 +1252,14 @@ fn draw_node(
         Pos2::new(rect.right() - 14.0 * zoom, footer_y),
         Align2::RIGHT_CENTER,
         calculation
-            .map(|value| format_power(value.power_kw))
+            .map(format_node_power)
             .unwrap_or_else(|| "—".into()),
         FontId::proportional(11.5 * zoom),
-        ORANGE,
+        if calculation.is_some_and(|value| value.generated_power_kw > 0.0) {
+            GREEN
+        } else {
+            ORANGE
+        },
     );
 }
 
@@ -1360,6 +1504,7 @@ fn recipe_machine_summary(recipe: &Recipe, data: &GameData) -> String {
     match recipe.kind {
         RecipeKind::BlastFurnace { .. } => format!("{machine}  •  configurable"),
         RecipeKind::Crafting => format!("{machine}  •  {:.1}s", recipe.time_seconds),
+        RecipeKind::Direct { .. } => format!("{machine}  •  direct"),
     }
 }
 
@@ -1433,6 +1578,25 @@ fn format_power(kw: f32) -> String {
         format!("{:.2} MW", kw / 1000.0)
     } else {
         format!("{:.0} kW", kw)
+    }
+}
+
+fn format_signed_power(kw: f32) -> String {
+    let sign = if kw > 0.01 {
+        "+"
+    } else if kw < -0.01 {
+        "−"
+    } else {
+        ""
+    };
+    format!("{sign}{}", format_power(kw.abs()))
+}
+
+fn format_node_power(value: &crate::model::NodeCalculation) -> String {
+    if value.generated_power_kw > 0.0 {
+        format!("+{}", format_power(value.generated_power_kw))
+    } else {
+        format_power(value.consumed_power_kw)
     }
 }
 

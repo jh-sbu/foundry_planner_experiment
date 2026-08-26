@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use eframe::egui::Pos2;
 
-use crate::data::{BlastFurnaceConfig, GameData, MachineKind, Recipe, RecipeKind};
+use crate::data::{
+    BlastFurnaceConfig, GameData, Machine, MachineKind, RateAnchor, Recipe, RecipeKind,
+};
 
 pub type NodeId = u64;
 
@@ -29,14 +31,24 @@ pub struct BlastFurnaceSettings {
 }
 
 #[derive(Clone, Debug)]
+pub enum MachineSettings {
+    Clock { percent: f32 },
+    BlastFurnace(BlastFurnaceSettings),
+    ResourceConverter { modules: u32, adjacent: u32 },
+    EndlessMiner { power_cores: u32 },
+    Reactor { utilization_percent: f32 },
+    AssemblyLine { painted: bool },
+    Fixed,
+}
+
+#[derive(Clone, Debug)]
 pub struct PlanNode {
     pub id: NodeId,
     pub recipe_id: String,
     pub machine_id: Option<String>,
     pub position: Pos2,
     pub pinned_primary_rate: Option<f32>,
-    pub clock_percent: f32,
-    pub blast_furnace: Option<BlastFurnaceSettings>,
+    pub settings: MachineSettings,
 }
 
 #[derive(Clone, Debug)]
@@ -63,14 +75,17 @@ pub enum ConnectionState {
 pub struct NodeCalculation {
     pub primary_rate: f32,
     pub machines: f32,
-    pub power_kw: f32,
+    pub consumed_power_kw: f32,
+    pub generated_power_kw: f32,
 }
 
 #[derive(Default)]
 pub struct PlanTotals {
     pub inputs: HashMap<String, f32>,
     pub outputs: HashMap<String, f32>,
-    pub power_kw: f32,
+    pub consumed_power_kw: f32,
+    pub generated_power_kw: f32,
+    pub net_power_kw: f32,
     pub machine_count: f32,
     pub has_values: bool,
 }
@@ -128,26 +143,33 @@ impl Plan {
                 .first()
                 .map(|machine| machine.id.clone())
         });
-        let blast_furnace = machine_id
+        let settings = machine_id
             .as_deref()
             .and_then(|id| data.machine(id))
-            .and_then(|machine| match &machine.kind {
-                MachineKind::BlastFurnace(config) => Some(BlastFurnaceSettings {
-                    towers: config.max_towers,
-                    temperature: config.optimal_temperature,
-                }),
-                MachineKind::Crafting => None,
-            });
+            .map(machine_default_settings)
+            .unwrap_or(MachineSettings::Clock { percent: 100.0 });
         self.nodes.push(PlanNode {
             id: self.next_id,
             recipe_id: recipe_id.to_owned(),
             machine_id,
             position,
             pinned_primary_rate: None,
-            clock_percent: 100.0,
-            blast_furnace,
+            settings,
         });
         self.next_id
+    }
+
+    pub fn set_machine(&mut self, id: NodeId, machine_id: String, data: &GameData) {
+        let Some(node) = self.nodes.iter_mut().find(|node| node.id == id) else {
+            return;
+        };
+        if node.machine_id.as_deref() == Some(&machine_id) {
+            return;
+        }
+        node.machine_id = Some(machine_id.clone());
+        if let Some(machine) = data.machine(&machine_id) {
+            node.settings = machine_default_settings(machine);
+        }
     }
 
     pub fn remove_node(&mut self, id: NodeId) {
@@ -258,22 +280,20 @@ impl Plan {
                 else {
                     continue;
                 };
-                let power_kw = node
+                let (consumed_power_kw, generated_power_kw) = node
                     .machine_id
                     .as_deref()
                     .and_then(|id| data.machine(id))
-                    .map_or(0.0, |machine| match machine.kind {
-                        MachineKind::Crafting => {
-                            machine.power_kw * machines * node.clock_percent.max(1.0) / 100.0
-                        }
-                        MachineKind::BlastFurnace(_) => machine.power_kw * machines,
+                    .map_or((0.0, 0.0), |machine| {
+                        node_power(node, machine, machines, primary_rate)
                     });
                 evaluation.nodes.insert(
                     *id,
                     NodeCalculation {
                         primary_rate,
                         machines,
-                        power_kw,
+                        consumed_power_kw,
+                        generated_power_kw,
                     },
                 );
             }
@@ -400,7 +420,8 @@ impl Plan {
                 continue;
             };
             evaluation.totals.machine_count += calculation.machines;
-            evaluation.totals.power_kw += calculation.power_kw;
+            evaluation.totals.consumed_power_kw += calculation.consumed_power_kw;
+            evaluation.totals.generated_power_kw += calculation.generated_power_kw;
 
             for (slot, ingredient) in recipe.inputs.iter().enumerate() {
                 let port = PortRef {
@@ -410,12 +431,15 @@ impl Plan {
                     item: ingredient.item.clone(),
                 };
                 if !self.is_connected(&port) {
-                    *evaluation
-                        .totals
-                        .inputs
-                        .entry(ingredient.item.clone())
-                        .or_default() += calculation.primary_rate
+                    let rate = calculation.primary_rate
                         * rate_ratio(node, recipe, PortSide::Input, slot, data);
+                    if rate > f32::EPSILON {
+                        *evaluation
+                            .totals
+                            .inputs
+                            .entry(ingredient.item.clone())
+                            .or_default() += rate;
+                    }
                 }
             }
             for (slot, ingredient) in recipe.outputs.iter().enumerate() {
@@ -426,15 +450,21 @@ impl Plan {
                     item: ingredient.item.clone(),
                 };
                 if !self.is_connected(&port) {
-                    *evaluation
-                        .totals
-                        .outputs
-                        .entry(ingredient.item.clone())
-                        .or_default() += calculation.primary_rate
+                    let rate = calculation.primary_rate
                         * rate_ratio(node, recipe, PortSide::Output, slot, data);
+                    if rate > f32::EPSILON {
+                        *evaluation
+                            .totals
+                            .outputs
+                            .entry(ingredient.item.clone())
+                            .or_default() += rate;
+                    }
                 }
             }
         }
+
+        evaluation.totals.net_power_kw =
+            evaluation.totals.generated_power_kw - evaluation.totals.consumed_power_kw;
 
         let mut outputs = Vec::new();
         for edge in &self.edges {
@@ -491,7 +521,8 @@ pub fn primary_rate_for_machine_count(
     machines: f32,
     data: &GameData,
 ) -> Option<f32> {
-    Some(per_machine_port_rate(node, recipe, PortSide::Output, 0, data)? * machines)
+    let (side, slot) = recipe_rate_anchor(recipe);
+    Some(per_machine_port_rate(node, recipe, side, slot, data)? * machines)
 }
 
 fn machine_count_for_primary_rate(
@@ -511,7 +542,9 @@ fn rate_ratio(
     slot: usize,
     data: &GameData,
 ) -> f32 {
-    let Some(primary_rate) = per_machine_port_rate(node, recipe, PortSide::Output, 0, data) else {
+    let (anchor_side, anchor_slot) = recipe_rate_anchor(recipe);
+    let Some(primary_rate) = per_machine_port_rate(node, recipe, anchor_side, anchor_slot, data)
+    else {
         return 0.0;
     };
     per_machine_port_rate(node, recipe, side, slot, data).unwrap_or(0.0)
@@ -542,10 +575,134 @@ fn per_machine_port_rate(
         (RecipeKind::BlastFurnace { .. }, Some(MachineKind::BlastFurnace(config))) => {
             Some(recipe.base_rate(ingredient) * blast_furnace_operating_speed_for(node, config))
         }
-        _ => {
-            let speed = machine.map_or(1.0, |machine| machine.speed);
-            Some(recipe.base_rate(ingredient) * speed * node.clock_percent.max(1.0) / 100.0)
+        (
+            RecipeKind::Direct {
+                optional_input_slot: Some(optional),
+                ..
+            },
+            Some(MachineKind::AssemblyLine(_)),
+        ) if side == PortSide::Input
+            && slot == *optional
+            && matches!(
+                node.settings,
+                MachineSettings::AssemblyLine { painted: false }
+            ) =>
+        {
+            Some(0.0)
         }
+        (_, Some(MachineKind::Crafting)) => {
+            let percent = match node.settings {
+                MachineSettings::Clock { percent } => percent,
+                _ => 100.0,
+            };
+            let speed = machine.map_or(1.0, |machine| machine.speed);
+            Some(recipe.base_rate(ingredient) * speed * percent.max(1.0) / 100.0)
+        }
+        (_, Some(MachineKind::ResourceConverter(config))) => {
+            let modules = match node.settings {
+                MachineSettings::ResourceConverter { modules, .. } => modules,
+                _ => config.max_modules,
+            }
+            .clamp(config.min_modules, config.max_modules);
+            let bonus_modules = modules.saturating_sub(config.ignored_modules) as f32;
+            Some(
+                recipe.base_rate(ingredient)
+                    * (1.0 + bonus_modules * config.speed_bonus_per_module),
+            )
+        }
+        (_, Some(MachineKind::EndlessMiner(config))) => {
+            let cores = match node.settings {
+                MachineSettings::EndlessMiner { power_cores } => power_cores,
+                _ => config.power_core_slots,
+            }
+            .min(config.power_core_slots) as f32;
+            Some(recipe.base_rate(ingredient) * (1.0 + cores * config.speed_increase_per_core))
+        }
+        (_, Some(MachineKind::Reactor)) => {
+            let utilization = match node.settings {
+                MachineSettings::Reactor {
+                    utilization_percent,
+                } => utilization_percent,
+                _ => 100.0,
+            }
+            .clamp(0.0, 100.0);
+            Some(recipe.base_rate(ingredient) * utilization / 100.0)
+        }
+        (_, Some(_)) => Some(recipe.base_rate(ingredient)),
+        _ => Some(recipe.base_rate(ingredient)),
+    }
+}
+
+pub fn recipe_rate_anchor(recipe: &Recipe) -> (PortSide, usize) {
+    match recipe.kind {
+        RecipeKind::Direct {
+            anchor: RateAnchor::Input(slot),
+            ..
+        } => (PortSide::Input, slot),
+        RecipeKind::Direct {
+            anchor: RateAnchor::Output(slot),
+            ..
+        } => (PortSide::Output, slot),
+        _ => (PortSide::Output, 0),
+    }
+}
+
+fn machine_default_settings(machine: &Machine) -> MachineSettings {
+    match &machine.kind {
+        MachineKind::Crafting => MachineSettings::Clock { percent: 100.0 },
+        MachineKind::BlastFurnace(config) => MachineSettings::BlastFurnace(BlastFurnaceSettings {
+            towers: config.max_towers,
+            temperature: config.optimal_temperature,
+        }),
+        MachineKind::ResourceConverter(config) => MachineSettings::ResourceConverter {
+            modules: config.max_modules,
+            adjacent: 0,
+        },
+        MachineKind::EndlessMiner(config) => MachineSettings::EndlessMiner {
+            power_cores: config.power_core_slots,
+        },
+        MachineKind::Reactor => MachineSettings::Reactor {
+            utilization_percent: 100.0,
+        },
+        MachineKind::AssemblyLine(_) => MachineSettings::AssemblyLine { painted: false },
+        MachineKind::FixedRate | MachineKind::Turbine { .. } => MachineSettings::Fixed,
+    }
+}
+
+fn node_power(node: &PlanNode, machine: &Machine, machines: f32, primary_rate: f32) -> (f32, f32) {
+    match &machine.kind {
+        MachineKind::Crafting => {
+            let percent = match node.settings {
+                MachineSettings::Clock { percent } => percent.max(1.0),
+                _ => 100.0,
+            };
+            (machine.power_kw * machines * percent / 100.0, 0.0)
+        }
+        MachineKind::ResourceConverter(config) => {
+            let adjacent = match node.settings {
+                MachineSettings::ResourceConverter { adjacent, .. } => adjacent,
+                _ => 0,
+            }
+            .min(config.max_adjacent) as f32;
+            let multiplier = (1.0 - adjacent * config.power_decrease_per_adjacent).max(0.0);
+            (machine.power_kw * machines * multiplier, 0.0)
+        }
+        MachineKind::Turbine { generation_kw } => (0.0, generation_kw * machines),
+        MachineKind::AssemblyLine(config) => {
+            let painting_energy = if matches!(
+                node.settings,
+                MachineSettings::AssemblyLine { painted: true }
+            ) {
+                config.painting_energy_per_product_kj
+            } else {
+                0.0
+            };
+            (
+                (config.energy_per_product_kj + painting_energy) * primary_rate / 60.0,
+                0.0,
+            )
+        }
+        _ => (machine.power_kw * machines, 0.0),
     }
 }
 
@@ -555,7 +712,7 @@ pub fn blast_furnace_config<'a>(
 ) -> Option<&'a BlastFurnaceConfig> {
     match &data.machine(node.machine_id.as_deref()?)?.kind {
         MachineKind::BlastFurnace(config) => Some(config),
-        MachineKind::Crafting => None,
+        _ => None,
     }
 }
 
@@ -577,11 +734,11 @@ fn blast_furnace_operating_speed_for(node: &PlanNode, config: &BlastFurnaceConfi
     let towers = furnace_towers(node, config);
     let optional_towers = towers.saturating_sub(config.min_towers) as f32;
     let max_speed = config.base_speed + optional_towers * config.tower_speed_increase;
-    let temperature = node
-        .blast_furnace
-        .as_ref()
-        .map_or(config.optimal_temperature, |settings| settings.temperature)
-        .clamp(config.min_temperature, config.optimal_temperature);
+    let temperature = match &node.settings {
+        MachineSettings::BlastFurnace(settings) => settings.temperature,
+        _ => config.optimal_temperature,
+    }
+    .clamp(config.min_temperature, config.optimal_temperature);
     let range = config.optimal_temperature - config.min_temperature;
     if range <= f32::EPSILON {
         return max_speed.max(0.0);
@@ -598,10 +755,11 @@ fn blast_furnace_hot_air_per_minute(node: &PlanNode, config: &BlastFurnaceConfig
 }
 
 fn furnace_towers(node: &PlanNode, config: &BlastFurnaceConfig) -> u32 {
-    node.blast_furnace
-        .as_ref()
-        .map_or(config.max_towers, |settings| settings.towers)
-        .clamp(config.min_towers, config.max_towers)
+    match &node.settings {
+        MachineSettings::BlastFurnace(settings) => settings.towers,
+        _ => config.max_towers,
+    }
+    .clamp(config.min_towers, config.max_towers)
 }
 
 fn solve_unique_values(equations: Vec<(Vec<f64>, f64)>, variable_count: usize) -> Vec<Option<f64>> {
@@ -693,7 +851,8 @@ fn solve_unique_values(equations: Vec<(Vec<f64>, f64)>, variable_count: usize) -
 mod tests {
     use super::*;
     use crate::data::{
-        BlastFurnaceConfig, Ingredient, Machine, MachineKind, MachineRecipeSelector, RecipeKind,
+        AssemblyLineConfig, BlastFurnaceConfig, Ingredient, Machine, MachineKind,
+        MachineRecipeSelector, RateAnchor, RecipeKind, ResourceConverterConfig,
         resolve_template_root,
     };
 
@@ -739,8 +898,75 @@ mod tests {
                 speed: 1.0,
                 power_kw: 10.0,
                 kind: MachineKind::Crafting,
+                required_resource_node: None,
             }],
         )
+    }
+
+    fn direct_recipe(
+        id: &str,
+        machine_id: &str,
+        inputs: Vec<Ingredient>,
+        outputs: Vec<Ingredient>,
+        anchor: RateAnchor,
+        optional_input_slot: Option<usize>,
+    ) -> Recipe {
+        Recipe {
+            id: id.into(),
+            name: id.into(),
+            inputs,
+            outputs,
+            time_seconds: 60.0,
+            tags: Vec::new(),
+            category: "Direct".into(),
+            kind: RecipeKind::Direct {
+                machine_id: machine_id.into(),
+                anchor,
+                optional_input_slot,
+            },
+        }
+    }
+
+    fn ingredient(item: &str, amount: f32) -> Ingredient {
+        Ingredient {
+            item: item.into(),
+            amount,
+        }
+    }
+
+    fn direct_machine(id: &str, power_kw: f32, kind: MachineKind) -> Machine {
+        Machine {
+            id: id.into(),
+            name: id.into(),
+            recipe_selector: MachineRecipeSelector::default(),
+            speed: 1.0,
+            power_kw,
+            kind,
+            required_resource_node: None,
+        }
+    }
+
+    fn matching_port(
+        data: &GameData,
+        node: NodeId,
+        recipe_id: &str,
+        side: PortSide,
+        item: &str,
+    ) -> PortRef {
+        let recipe = data.recipe(recipe_id).unwrap();
+        let ingredients = match side {
+            PortSide::Input => &recipe.inputs,
+            PortSide::Output => &recipe.outputs,
+        };
+        PortRef {
+            node,
+            side,
+            slot: ingredients
+                .iter()
+                .position(|ingredient| ingredient.item == item)
+                .unwrap(),
+            item: item.into(),
+        }
     }
 
     fn blast_furnace_data() -> GameData {
@@ -807,6 +1033,7 @@ mod tests {
                     tower_speed_increase: 0.25,
                     tower_hot_air_increase: 0.125,
                 }),
+                required_resource_node: None,
             }],
         )
     }
@@ -891,7 +1118,10 @@ mod tests {
                 < 0.01
         );
 
-        plan.nodes[0].blast_furnace.as_mut().unwrap().towers = 1;
+        let MachineSettings::BlastFurnace(settings) = &mut plan.nodes[0].settings else {
+            panic!("blast furnace settings expected");
+        };
+        settings.towers = 1;
         let pinned_evaluation = plan.evaluate(&data);
         assert!((pinned_evaluation.node(node).unwrap().primary_rate - 11_520.0).abs() < 0.01);
         assert!((pinned_evaluation.node(node).unwrap().machines - 2.0).abs() < 0.01);
@@ -909,7 +1139,9 @@ mod tests {
                 < 0.01
         );
 
-        let settings = plan.nodes[0].blast_furnace.as_mut().unwrap();
+        let MachineSettings::BlastFurnace(settings) = &mut plan.nodes[0].settings else {
+            panic!("blast furnace settings expected");
+        };
         settings.towers = 5;
         settings.temperature = 1_500.0;
         let minimum_temperature_rate =
@@ -1125,11 +1357,12 @@ mod tests {
                 speed: 2.0,
                 power_kw: 10.0,
                 kind: MachineKind::Crafting,
+                required_resource_node: None,
             }],
         );
         let mut plan = Plan::default();
         let node = plan.add_recipe("product", Pos2::ZERO, &data);
-        plan.nodes[0].clock_percent = 50.0;
+        plan.nodes[0].settings = MachineSettings::Clock { percent: 50.0 };
         let rate = primary_rate_for_machine_count(
             &plan.nodes[0],
             data.recipe("product").unwrap(),
@@ -1140,10 +1373,198 @@ mod tests {
         pin(&mut plan, node, rate);
         assert!((plan.evaluate(&data).node(node).unwrap().machines - 3.0).abs() < 0.001);
 
-        plan.nodes[0].clock_percent = 100.0;
+        plan.nodes[0].settings = MachineSettings::Clock { percent: 100.0 };
         let calculation = plan.evaluate(&data).node(node).copied().unwrap();
         assert!((calculation.primary_rate - rate).abs() < 0.001);
         assert!((calculation.machines - 1.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn resource_converter_modules_and_adjacency_affect_rates_and_power() {
+        let data = GameData::from_test_parts(
+            vec![direct_recipe(
+                "converter_recipe",
+                "converter",
+                vec![ingredient("feed", 10.0)],
+                vec![ingredient("product", 20.0)],
+                RateAnchor::Output(0),
+                None,
+            )],
+            vec![direct_machine(
+                "converter",
+                100.0,
+                MachineKind::ResourceConverter(ResourceConverterConfig {
+                    min_modules: 2,
+                    max_modules: 7,
+                    ignored_modules: 2,
+                    speed_bonus_per_module: 1.0,
+                    max_adjacent: 2,
+                    power_decrease_per_adjacent: 0.2,
+                }),
+            )],
+        );
+        let mut plan = Plan::default();
+        let node = plan.add_recipe("converter_recipe", Pos2::ZERO, &data);
+        let recipe = data.recipe("converter_recipe").unwrap();
+        let maximum_rate =
+            primary_rate_for_machine_count(&plan.nodes[0], recipe, 1.0, &data).unwrap();
+        assert!((maximum_rate - 120.0).abs() < 0.001);
+        pin(&mut plan, node, maximum_rate);
+
+        let MachineSettings::ResourceConverter { modules, adjacent } = &mut plan.nodes[0].settings
+        else {
+            panic!("resource converter settings expected");
+        };
+        *modules = 2;
+        *adjacent = 2;
+        let evaluation = plan.evaluate(&data);
+        let calculation = evaluation.node(node).unwrap();
+        assert!((calculation.machines - 6.0).abs() < 0.001);
+        assert!((calculation.consumed_power_kw - 360.0).abs() < 0.001);
+        assert!((evaluation.totals.net_power_kw + 360.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn input_anchored_sinks_and_generators_have_correct_power_totals() {
+        let data = GameData::from_test_parts(
+            vec![
+                direct_recipe(
+                    "cooling",
+                    "cooling_tower",
+                    vec![ingredient("exhaust", 50.0)],
+                    Vec::new(),
+                    RateAnchor::Input(0),
+                    None,
+                ),
+                direct_recipe(
+                    "turbine_recipe",
+                    "turbine",
+                    vec![ingredient("steam", 60.0)],
+                    vec![ingredient("exhaust", 60.0)],
+                    RateAnchor::Output(0),
+                    None,
+                ),
+            ],
+            vec![
+                direct_machine("cooling_tower", 5.0, MachineKind::FixedRate),
+                direct_machine(
+                    "turbine",
+                    0.0,
+                    MachineKind::Turbine {
+                        generation_kw: 36_000.0,
+                    },
+                ),
+            ],
+        );
+        let mut plan = Plan::default();
+        let cooling = plan.add_recipe("cooling", Pos2::ZERO, &data);
+        let turbine = plan.add_recipe("turbine_recipe", Pos2::ZERO, &data);
+        pin(&mut plan, cooling, 100.0);
+        pin(&mut plan, turbine, 60.0);
+
+        let evaluation = plan.evaluate(&data);
+        assert!((evaluation.node(cooling).unwrap().machines - 2.0).abs() < 0.001);
+        assert!((evaluation.totals.inputs["exhaust"] - 100.0).abs() < 0.001);
+        assert!((evaluation.totals.consumed_power_kw - 10.0).abs() < 0.001);
+        assert!((evaluation.totals.generated_power_kw - 36_000.0).abs() < 0.001);
+        assert!((evaluation.totals.net_power_kw - 35_990.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn assembly_paint_is_optional_and_power_tracks_product_rate() {
+        let mut assembly = direct_recipe(
+            "assembly_recipe",
+            "assembly_line",
+            vec![ingredient("parts", 2.0), ingredient("paint", 100.0)],
+            vec![ingredient("robot", 1.0)],
+            RateAnchor::Output(0),
+            Some(1),
+        );
+        assembly.time_seconds = 60.0 / 32.0;
+        let data = GameData::from_test_parts(
+            vec![assembly],
+            vec![direct_machine(
+                "assembly_line",
+                0.0,
+                MachineKind::AssemblyLine(AssemblyLineConfig {
+                    energy_per_product_kj: 100.0,
+                    painting_energy_per_product_kj: 50.0,
+                    painted_input_slot: Some(1),
+                }),
+            )],
+        );
+        let mut plan = Plan::default();
+        let node = plan.add_recipe("assembly_recipe", Pos2::ZERO, &data);
+        pin(&mut plan, node, 32.0);
+
+        let metal = plan.evaluate(&data);
+        assert!((metal.totals.inputs["parts"] - 64.0).abs() < 0.001);
+        assert!(!metal.totals.inputs.contains_key("paint"));
+        assert!((metal.totals.consumed_power_kw - 53.333_332).abs() < 0.001);
+
+        plan.nodes[0].settings = MachineSettings::AssemblyLine { painted: true };
+        let painted = plan.evaluate(&data);
+        assert!((painted.totals.inputs["paint"] - 3_200.0).abs() < 0.001);
+        assert!((painted.totals.consumed_power_kw - 80.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn installed_nuclear_chain_balances_and_generates_power_when_available() {
+        let Ok(root) = resolve_template_root() else {
+            return;
+        };
+        let data = GameData::load(&root).unwrap();
+        let mut plan = Plan::default();
+        let reactor = plan.add_recipe("direct:_base_npp_reactor_base", Pos2::ZERO, &data);
+        let steam_generator =
+            plan.add_recipe("direct:_base_npp_steam_generator_base", Pos2::ZERO, &data);
+        let turbine = plan.add_recipe("direct:_base_npp_steam_turbine_base", Pos2::ZERO, &data);
+        let cooling = plan.add_recipe("direct:_base_npp_cooling_tower_base", Pos2::ZERO, &data);
+        pin(&mut plan, reactor, 180_000.0);
+
+        for (from_node, from_recipe, to_node, to_recipe, item) in [
+            (
+                reactor,
+                "direct:_base_npp_reactor_base",
+                steam_generator,
+                "direct:_base_npp_steam_generator_base",
+                "_base_npp_reactor_compound_energized",
+            ),
+            (
+                steam_generator,
+                "direct:_base_npp_steam_generator_base",
+                reactor,
+                "direct:_base_npp_reactor_base",
+                "_base_npp_reactor_compound_depleted",
+            ),
+            (
+                steam_generator,
+                "direct:_base_npp_steam_generator_base",
+                turbine,
+                "direct:_base_npp_steam_turbine_base",
+                "_base_npp_steam_high_pressure",
+            ),
+            (
+                turbine,
+                "direct:_base_npp_steam_turbine_base",
+                cooling,
+                "direct:_base_npp_cooling_tower_base",
+                "_base_npp_steam_exhaust",
+            ),
+        ] {
+            assert!(plan.connect(
+                matching_port(&data, from_node, from_recipe, PortSide::Output, item),
+                matching_port(&data, to_node, to_recipe, PortSide::Input, item),
+            ));
+        }
+
+        let evaluation = plan.evaluate(&data);
+        assert!((evaluation.node(reactor).unwrap().machines - 1.0).abs() < 0.001);
+        assert!((evaluation.node(steam_generator).unwrap().machines - 1.0).abs() < 0.001);
+        assert!((evaluation.node(turbine).unwrap().machines - 10.0).abs() < 0.001);
+        assert!((evaluation.node(cooling).unwrap().machines - 2.0).abs() < 0.001);
+        assert!((evaluation.totals.generated_power_kw - 360_000.0).abs() < 0.1);
+        assert_eq!(evaluation.unresolved_nodes, 0);
     }
 
     #[test]
