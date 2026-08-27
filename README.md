@@ -64,7 +64,8 @@ and a balanced Reactor → Steam Generator → Turbine → Cooling Tower loop.
 
 ## Imported process coverage
 
-- Resource converters and boilers, including air intakes and hot-air stoves.
+- Resource converters and boilers, including air intakes and hot-air stoves;
+  submerged liquid intakes that source water into pipes and pipelines.
 - Pumpjacks joined with reservoirs; ore-vein miners joined with vein and terrain
   templates, including mining-fluid demand and fracking power overhead.
 - Endless miners backed by valid `SpecialWorldObjectTemplate` resource nodes.

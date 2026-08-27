@@ -666,6 +666,34 @@ impl GameData {
                             None,
                         );
                     }
+                    "PipeIntake" => {
+                        let Some(output_rate) = pipe_intake_output_rate_per_minute(entry) else {
+                            continue;
+                        };
+                        let machine_id = id.clone();
+                        self.machines.push(Machine {
+                            id,
+                            name: name.clone(),
+                            recipe_selector: MachineRecipeSelector::default(),
+                            speed: 1.0,
+                            power_kw: 0.0,
+                            kind: MachineKind::FixedRate,
+                            required_resource_node: None,
+                        });
+                        self.push_direct_recipe(
+                            format!("direct:{machine_id}"),
+                            name,
+                            Vec::new(),
+                            vec![Ingredient {
+                                item: "_base_water".to_owned(),
+                                amount: output_rate,
+                            }],
+                            "Extraction",
+                            machine_id,
+                            RateAnchor::Output(0),
+                            None,
+                        );
+                    }
                     "Boiler" => {
                         let Some(input) = direct_ingredient(
                             entry,
@@ -1400,6 +1428,16 @@ fn scaled_ingredient_list(entry: &Yaml, key: &str, scale: f32) -> Vec<Ingredient
         .collect()
 }
 
+fn pipe_intake_output_rate_per_minute(entry: &Yaml) -> Option<f32> {
+    let per_second = value(entry, "fbm_ioFluidBoxes")?
+        .as_vec()?
+        .iter()
+        .find(|fluid_box| bool_field(fluid_box, "isInput") == Some(false))
+        .and_then(|fluid_box| number_field(fluid_box, "transferRatePerSecond_liter"))?;
+    let per_minute = per_second * 60.0;
+    (per_minute.is_finite() && per_minute > 0.0).then_some(per_minute)
+}
+
 fn resource_converter_module(entry: &Yaml) -> Option<(String, f32, u32)> {
     let module = value(entry, "resourceConverter_speedBonusModules")?
         .as_vec()?
@@ -1896,6 +1934,91 @@ mod tests {
     }
 
     #[test]
+    fn pipe_intakes_produce_water_at_their_output_transfer_rate() {
+        let templates = TestDirectory::with_yaml(
+            r#"BuildableObjectTemplate:
+  regular:
+    type: PipeIntake
+    nameOverride: Liquid Intake
+    fbm_ioFluidBoxes:
+      - isInput: False
+        transferRatePerSecond_liter: 500
+  pipeline:
+    type: PipeIntake
+    nameOverride: Liquid Intake (Pipeline)
+    fbm_ioFluidBoxes:
+      - isInput: False
+        transferRatePerSecond_liter: 3000
+  input_only:
+    type: PipeIntake
+    fbm_ioFluidBoxes:
+      - isInput: True
+        transferRatePerSecond_liter: 500
+  missing_rate:
+    type: PipeIntake
+    fbm_ioFluidBoxes:
+      - isInput: False
+  zero_rate:
+    type: PipeIntake
+    fbm_ioFluidBoxes:
+      - isInput: False
+        transferRatePerSecond_liter: 0
+  pump_adapter:
+    type: Pump
+    fbm_ioFluidBoxes:
+      - isInput: False
+        transferRatePerSecond_liter: 6000
+"#,
+        );
+        let mut data = GameData::default();
+        data.load_machines(&templates.0)
+            .expect("test buildables should load");
+        data.rebuild_indexes();
+
+        for (machine_id, expected_rate) in [("regular", 30_000.0), ("pipeline", 180_000.0)] {
+            let machine = data.machine(machine_id).expect("intake machine");
+            assert!(matches!(machine.kind, MachineKind::FixedRate));
+            assert_eq!(machine.power_kw, 0.0);
+
+            let recipe = data
+                .recipe(&format!("direct:{machine_id}"))
+                .expect("intake direct process");
+            assert!(recipe.inputs.is_empty());
+            assert_eq!(recipe.category, "Extraction");
+            assert_eq!(recipe.outputs.len(), 1);
+            assert_eq!(recipe.outputs[0].item, "_base_water");
+            assert!((recipe.outputs[0].amount - expected_rate).abs() < 0.01);
+            assert!(matches!(
+                recipe.kind,
+                RecipeKind::Direct {
+                    anchor: RateAnchor::Output(0),
+                    ..
+                }
+            ));
+            let machine_options = data.machine_options(recipe);
+            assert_eq!(machine_options.len(), 1);
+            assert_eq!(machine_options[0].id, machine_id);
+        }
+
+        for ignored in ["input_only", "missing_rate", "zero_rate", "pump_adapter"] {
+            assert!(data.machine(ignored).is_none());
+            assert!(data.recipe(&format!("direct:{ignored}")).is_none());
+        }
+        let water_producers = data.recipes_producing("_base_water");
+        assert_eq!(water_producers.len(), 2);
+        assert!(
+            water_producers
+                .iter()
+                .any(|recipe| recipe.id == "direct:regular")
+        );
+        assert!(
+            water_producers
+                .iter()
+                .any(|recipe| recipe.id == "direct:pipeline")
+        );
+    }
+
+    #[test]
     fn machine_recipe_selectors_match_tags_or_explicit_recipe_ids() {
         let recipe = Recipe {
             id: "fixed_recipe".into(),
@@ -2077,6 +2200,33 @@ mod tests {
             boiler.outputs.iter().any(
                 |output| output.item == "_base_steam" && (output.amount - 3_600.0).abs() < 0.01
             )
+        );
+
+        for (machine_id, expected_rate) in [
+            ("_base_pipe_intake_i", 30_000.0),
+            ("_base_pipeline_intake_i", 180_000.0),
+        ] {
+            let machine = data.machine(machine_id).expect("liquid intake building");
+            assert!(matches!(machine.kind, MachineKind::FixedRate));
+            assert_eq!(machine.power_kw, 0.0);
+            let intake = data
+                .recipe(&format!("direct:{machine_id}"))
+                .expect("liquid intake direct process");
+            assert!(intake.inputs.is_empty());
+            assert!(intake.outputs.iter().any(|output| {
+                output.item == "_base_water" && (output.amount - expected_rate).abs() < 0.01
+            }));
+            assert_eq!(data.machine_options(intake)[0].id, machine_id);
+        }
+        assert!(
+            data.recipes_producing("_base_water")
+                .iter()
+                .any(|recipe| recipe.id == "direct:_base_pipe_intake_i")
+        );
+        assert!(
+            data.recipes_producing("_base_water")
+                .iter()
+                .any(|recipe| recipe.id == "direct:_base_pipeline_intake_i")
         );
 
         assert!(
