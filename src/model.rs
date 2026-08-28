@@ -24,13 +24,13 @@ pub struct PortRef {
     pub item: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BlastFurnaceSettings {
     pub towers: u32,
     pub temperature: f32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum MachineSettings {
     Clock { percent: f32 },
     BlastFurnace(BlastFurnaceSettings),
@@ -136,6 +136,15 @@ impl PlanEvaluation {
 }
 
 impl Plan {
+    pub(crate) fn from_parts(nodes: Vec<PlanNode>, edges: Vec<Edge>) -> Self {
+        let next_id = nodes.iter().map(|node| node.id).max().unwrap_or_default();
+        Self {
+            nodes,
+            edges,
+            next_id,
+        }
+    }
+
     pub fn add_recipe(&mut self, recipe_id: &str, position: Pos2, data: &GameData) -> NodeId {
         self.next_id += 1;
         let machine_id = data.recipe(recipe_id).and_then(|recipe| {

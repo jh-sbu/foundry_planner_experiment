@@ -30,6 +30,10 @@ explaining how to configure the path.
 
 ## Use
 
+- Use `Load…`, `Save`, and `Save As…` in the top bar to manage portable
+  `.foundry-plan` files. `Ctrl`/`Command`+O loads, `Ctrl`/`Command`+S saves, and
+  `Ctrl`/`Command`+Shift+S saves to a new file. Plans include the graph, machine
+  settings, pinned rates, node positions, and current workspace view.
 - Search the recipe library and press `+` (or double-click a recipe) to add it.
 - Drag a node by its header. Middle-drag the workspace to pan and scroll to zoom.
 - Drag a red input port onto empty space to choose a recipe that produces it.

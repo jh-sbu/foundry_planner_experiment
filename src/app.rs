@@ -5,6 +5,7 @@ use eframe::egui::{
     RichText, Sense, Stroke, StrokeKind, TextStyle, Vec2,
     text::{LayoutJob, TextFormat},
 };
+use rfd::FileDialog;
 
 use crate::{
     data::{GameData, MachineKind, Recipe, RecipeKind, TEMPLATE_ROOT_ENV, resolve_template_root},
@@ -13,6 +14,7 @@ use crate::{
         blast_furnace_hot_air_rate, blast_furnace_operating_speed, primary_rate_for_machine_count,
         recipe_rate_anchor,
     },
+    persistence::{self, PLAN_FILE_EXTENSION},
 };
 
 const SIDEBAR_WIDTH: f32 = 292.0;
@@ -57,6 +59,16 @@ pub struct PlannerApp {
     output_edits: HashMap<NodeId, String>,
     next_spawn: usize,
     fit_requested: bool,
+    current_plan_path: Option<PathBuf>,
+    plan_message: String,
+    plan_message_is_error: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlanFileAction {
+    Load,
+    Save,
+    SaveAs,
 }
 
 fn load_game_data() -> (Option<PathBuf>, Result<GameData, String>) {
@@ -99,6 +111,9 @@ impl PlannerApp {
             output_edits: HashMap::new(),
             next_spawn: 0,
             fit_requested: false,
+            current_plan_path: None,
+            plan_message: String::new(),
+            plan_message_is_error: false,
         }
     }
 
@@ -127,6 +142,84 @@ impl PlannerApp {
         self.next_spawn += 1;
     }
 
+    fn handle_plan_file_action(&mut self, action: PlanFileAction) {
+        match action {
+            PlanFileAction::Load => self.load_plan_dialog(),
+            PlanFileAction::Save => {
+                if let Some(path) = self.current_plan_path.clone() {
+                    self.save_plan_to(path);
+                } else {
+                    self.save_plan_as_dialog();
+                }
+            }
+            PlanFileAction::SaveAs => self.save_plan_as_dialog(),
+        }
+    }
+
+    fn load_plan_dialog(&mut self) {
+        let mut dialog = plan_file_dialog();
+        if let Some(parent) = self
+            .current_plan_path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+        {
+            dialog = dialog.set_directory(parent);
+        }
+        let Some(path) = dialog.pick_file() else {
+            return;
+        };
+        match persistence::load_plan(&path, &self.data) {
+            Ok(loaded) => {
+                self.plan = loaded.plan;
+                self.pan = loaded.pan;
+                self.zoom = loaded.zoom;
+                self.current_plan_path = Some(path.clone());
+                self.selected_node = None;
+                self.dragged_port = None;
+                self.chooser = None;
+                self.count_edits.clear();
+                self.output_edits.clear();
+                self.recipe_search.clear();
+                self.next_spawn = self.plan.nodes.len();
+                self.fit_requested = false;
+                self.set_plan_message(format!("Loaded {}", display_file_name(&path)), false);
+            }
+            Err(error) => self.set_plan_message(error.to_string(), true),
+        }
+    }
+
+    fn save_plan_as_dialog(&mut self) {
+        let mut dialog = plan_file_dialog();
+        if let Some(path) = &self.current_plan_path {
+            if let Some(parent) = path.parent() {
+                dialog = dialog.set_directory(parent);
+            }
+            if let Some(name) = path.file_name() {
+                dialog = dialog.set_file_name(name.to_string_lossy());
+            }
+        } else {
+            dialog = dialog.set_file_name(format!("untitled.{PLAN_FILE_EXTENSION}"));
+        }
+        if let Some(path) = dialog.save_file() {
+            self.save_plan_to(with_plan_extension(path));
+        }
+    }
+
+    fn save_plan_to(&mut self, path: PathBuf) {
+        match persistence::save_plan(&path, &self.plan, self.pan, self.zoom) {
+            Ok(()) => {
+                self.current_plan_path = Some(path.clone());
+                self.set_plan_message(format!("Saved {}", display_file_name(&path)), false);
+            }
+            Err(error) => self.set_plan_message(error.to_string(), true),
+        }
+    }
+
+    fn set_plan_message(&mut self, message: String, is_error: bool) {
+        self.plan_message = message;
+        self.plan_message_is_error = is_error;
+    }
+
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top_bar")
             .exact_height(58.0)
@@ -153,7 +246,11 @@ impl PlannerApp {
                     ui.add_space(14.0);
                     ui.label(
                         RichText::new(format!(
-                            "{} nodes  •  {} links",
+                            "{}  •  {} nodes  •  {} links",
+                            self.current_plan_path
+                                .as_deref()
+                                .map(display_file_name)
+                                .unwrap_or_else(|| "Untitled".to_owned()),
                             self.plan.nodes.len(),
                             self.plan.edges.len()
                         ))
@@ -166,6 +263,28 @@ impl PlannerApp {
                             self.count_edits.clear();
                             self.output_edits.clear();
                             self.next_spawn = 0;
+                            self.set_plan_message("Plan cleared".to_owned(), false);
+                        }
+                        if ui
+                            .button("Save As…")
+                            .on_hover_text("Save as (Ctrl/Command+Shift+S)")
+                            .clicked()
+                        {
+                            self.handle_plan_file_action(PlanFileAction::SaveAs);
+                        }
+                        if ui
+                            .button("Save")
+                            .on_hover_text("Save (Ctrl/Command+S)")
+                            .clicked()
+                        {
+                            self.handle_plan_file_action(PlanFileAction::Save);
+                        }
+                        if ui
+                            .button("Load…")
+                            .on_hover_text("Load (Ctrl/Command+O)")
+                            .clicked()
+                        {
+                            self.handle_plan_file_action(PlanFileAction::Load);
                         }
                         let data_root_hover = self
                             .data_root
@@ -182,7 +301,6 @@ impl PlannerApp {
                         if ui.button("Fit plan").clicked() {
                             self.fit_requested = true;
                         }
-                        ui.label(RichText::new("Drag ports to grow the plan").color(MUTED));
                     });
                 });
             });
@@ -208,6 +326,15 @@ impl PlannerApp {
                 );
                 ui.add_space(7.0);
                 ui.label(RichText::new(&self.load_message).small().color(MUTED));
+                if !self.plan_message.is_empty() {
+                    ui.label(RichText::new(&self.plan_message).small().color(
+                        if self.plan_message_is_error {
+                            RED
+                        } else {
+                            CYAN
+                        },
+                    ));
+                }
                 ui.add_space(8.0);
 
                 let needle = self.recipe_search.trim().to_lowercase();
@@ -1052,6 +1179,9 @@ impl PlannerApp {
 
 impl eframe::App for PlannerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(action) = requested_plan_file_action(ctx) {
+            self.handle_plan_file_action(action);
+        }
         self.top_bar(ctx);
         self.recipe_library(ctx);
         let evaluation = self.plan.evaluate(&self.data);
@@ -1069,6 +1199,42 @@ impl eframe::App for PlannerApp {
         }
         ctx.request_repaint();
     }
+}
+
+fn requested_plan_file_action(ctx: &egui::Context) -> Option<PlanFileAction> {
+    ctx.input(|input| {
+        if !input.modifiers.command || input.modifiers.alt {
+            return None;
+        }
+        if input.key_pressed(Key::S) {
+            return Some(if input.modifiers.shift {
+                PlanFileAction::SaveAs
+            } else {
+                PlanFileAction::Save
+            });
+        }
+        if input.key_pressed(Key::O) && !input.modifiers.shift {
+            return Some(PlanFileAction::Load);
+        }
+        None
+    })
+}
+
+fn plan_file_dialog() -> FileDialog {
+    FileDialog::new().add_filter("FOUNDRY plan", &[PLAN_FILE_EXTENSION])
+}
+
+fn with_plan_extension(mut path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension(PLAN_FILE_EXTENSION);
+    }
+    path
+}
+
+fn display_file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 fn node_delete_requested(ctx: &egui::Context) -> bool {
@@ -1628,13 +1794,20 @@ mod tests {
     }
 
     fn key_input(key: Key) -> egui::RawInput {
-        let mut input = egui::RawInput::default();
+        key_input_with_modifiers(key, egui::Modifiers::NONE)
+    }
+
+    fn key_input_with_modifiers(key: Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            modifiers,
+            ..Default::default()
+        };
         input.events.push(egui::Event::Key {
             key,
             physical_key: None,
             pressed: true,
             repeat: false,
-            modifiers: egui::Modifiers::NONE,
+            modifiers,
         });
         input
     }
@@ -1666,6 +1839,43 @@ mod tests {
     #[test]
     fn unrelated_keys_do_not_request_node_deletion() {
         assert!(!delete_requested_for(Key::Enter, false));
+    }
+
+    #[test]
+    fn plan_file_shortcuts_map_to_expected_actions() {
+        let command = egui::Modifiers {
+            command: true,
+            ctrl: true,
+            ..egui::Modifiers::NONE
+        };
+        let command_shift = egui::Modifiers {
+            shift: true,
+            ..command
+        };
+        for (key, modifiers, expected) in [
+            (Key::O, command, PlanFileAction::Load),
+            (Key::S, command, PlanFileAction::Save),
+            (Key::S, command_shift, PlanFileAction::SaveAs),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actual = None;
+            let _ = ctx.run(key_input_with_modifiers(key, modifiers), |ctx| {
+                actual = requested_plan_file_action(ctx);
+            });
+            assert_eq!(actual, Some(expected));
+        }
+    }
+
+    #[test]
+    fn save_paths_get_the_plan_extension_when_missing() {
+        assert_eq!(
+            with_plan_extension(PathBuf::from("factory")),
+            PathBuf::from("factory.foundry-plan")
+        );
+        assert_eq!(
+            with_plan_extension(PathBuf::from("factory.json")),
+            PathBuf::from("factory.json")
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 mod app;
 mod data;
 mod model;
+mod persistence;
 
 use app::PlannerApp;
 
